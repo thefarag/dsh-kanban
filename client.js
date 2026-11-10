@@ -199,6 +199,8 @@ window.__ModuleLoader__.load({
 			'header.resume': 'Resume board',
 			'header.refresh': 'Refresh',
 			'header.close': 'Close',
+			'header.speakThought': 'Speak a thought',
+			'header.thoughts': 'Thoughts',
 
 			'project.select': 'Select project',
 			'project.none': 'No projects yet',
@@ -355,6 +357,25 @@ window.__ModuleLoader__.load({
 			'new.titleRequired': 'Enter a title to create the ticket',
 			'new.create': 'Create ticket',
 			'new.creating': 'Creating…',
+
+			// Thought intake (KB-1). Shared labels reuse existing keys
+			// (actions.cancel, execution.openSession, header.close).
+			'thought.title': 'Speak a thought',
+			'thought.field': 'Thought',
+			'thought.placeholder': 'Say it how it comes. One thought is enough.',
+			'thought.send': 'Send thought',
+			'thought.sending': 'Sending…',
+			'thought.success': 'Thought recorded — a product manager is on it.',
+			'thought.pausedHint': 'Resume the board to capture a thought',
+			'thought.close': 'Close thoughts',
+			'thought.empty': 'No thoughts yet. Press Speak a thought to capture one.',
+			'thought.count': '{n} thoughts',
+			'thought.expand': 'Expand',
+			'thought.collapse': 'Collapse',
+			'thought.status.recorded': 'Recorded',
+			'thought.status.working': 'Thinking…',
+			'thought.status.done': 'Done',
+			'thought.status.failed': 'Failed',
 
 			'scan.title': 'Project scan',
 			'scan.subtitle': 'Scanned {ago}',
@@ -590,6 +611,8 @@ window.__ModuleLoader__.load({
 			'header.resume': '恢复看板',
 			'header.refresh': '刷新',
 			'header.close': '关闭',
+			'header.speakThought': '说出想法',
+			'header.thoughts': '想法',
 
 			'project.select': '选择项目',
 			'project.none': '暂无项目',
@@ -746,6 +769,24 @@ window.__ModuleLoader__.load({
 			'new.titleRequired': '请输入标题以创建任务',
 			'new.create': '创建任务',
 			'new.creating': '创建中…',
+
+			// 想法记录（KB-1）。共用文案复用现有键（actions.cancel、execution.openSession、header.close）。
+			'thought.title': '说出想法',
+			'thought.field': '想法',
+			'thought.placeholder': '想到什么就说什么，一个想法就够了。',
+			'thought.send': '发送想法',
+			'thought.sending': '发送中…',
+			'thought.success': '已记录想法，产品经理正在处理。',
+			'thought.pausedHint': '恢复看板后才能记录想法',
+			'thought.close': '关闭想法',
+			'thought.empty': '还没有想法。点击“说出想法”记录一个。',
+			'thought.count': '{n} 个想法',
+			'thought.expand': '展开',
+			'thought.collapse': '收起',
+			'thought.status.recorded': '已记录',
+			'thought.status.working': '思考中…',
+			'thought.status.done': '已完成',
+			'thought.status.failed': '失败',
 
 			'scan.title': '项目扫描',
 			'scan.subtitle': '{ago}扫描',
@@ -1298,6 +1339,29 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-hint--warn{color:var(--dsw-alias-state-warn-primary)}
 .kb-drawer--member{width:min(560px,96%)}
 .kb-drawer--roles{width:min(720px,96%)}
+.kb-drawer--thoughts{width:min(560px,96%)}
+.kb-thoughtsHeadCount{font-size:10.5px;font-weight:600;color:var(--dsw-alias-label-secondary);white-space:nowrap;flex:none}
+.kb-thoughtsList{display:flex;flex-direction:column;gap:8px}
+.kb-thoughtRow{display:flex;flex-direction:column;gap:6px;min-width:0;padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
+.kb-thoughtTop{display:flex;align-items:center;gap:6px;min-width:0}
+.kb-thoughtStatus{display:inline-flex;align-items:center;gap:4px;height:18px;padding:0 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);font-size:10px;font-weight:600;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.kb-thoughtStatus--working{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 8%,transparent)}
+.kb-thoughtStatus--done{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
+.kb-thoughtStatus--failed{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+.kb-thoughtStatus--recorded{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l2)}
+.kb-thoughtAge{margin-left:auto;font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap;flex:none;font-variant-numeric:tabular-nums}
+.kb-thoughtText{font-size:12.5px;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.kb-thoughtText--expanded{display:block;-webkit-line-clamp:unset;overflow:visible}
+.kb-thoughtExpand{align-self:flex-start;padding:0;border:0;background:transparent;color:var(--dsw-alias-brand-primary);font-size:11px;cursor:pointer}
+.kb-thoughtExpand:hover{text-decoration:underline}
+.kb-thoughtMeta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-thoughtChip{display:inline-flex;align-items:center;height:20px;max-width:100%;padding:0 7px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:transparent;color:var(--dsw-alias-label-primary);font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kb-thoughtChip:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
+.kb-thoughtError{font-size:11px;line-height:1.45;color:var(--dsw-alias-state-error-primary);overflow-wrap:anywhere}
+.kb-thoughtEmpty{display:flex;flex-direction:column;align-items:center;gap:8px;padding:36px 16px;text-align:center;font-size:12px;line-height:1.55;color:var(--dsw-alias-label-secondary)}
+.kb-thoughtEmptyIcon{display:inline-flex;color:var(--dsw-alias-label-secondary);opacity:.8}
+.kb-thoughtCounter{align-self:flex-end;font-size:10px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+@container kb (max-width:660px){.kb-drawer--thoughts{width:100%}}
 .kb-formField{display:flex;flex-direction:column;gap:4px;min-width:0}
 .kb-textarea{width:100%;min-height:96px;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:1.5;resize:vertical;outline:none}
 .kb-textarea:focus{border-color:var(--dsw-alias-border-l2)}
@@ -1530,6 +1594,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			return h(
 				'button',
 				{
+					ref: props.buttonRef,
 					type: props.type || 'button',
 					className: classNames(
 						'kb-btn',
@@ -1599,6 +1664,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 
 		function defaultSuccessText(action, value, payload, t) {
 			const result = value && typeof value === 'object' ? value : {}
+			if (action === 'submitThought') return t('thought.success')
 			if (action === 'createTicket' && result.ticket) return t('toast.created', { id: result.ticket.id })
 			if (action === 'moveTicket') {
 				const column = result.ticket && result.ticket.column ? result.ticket.column : payload && payload.column
@@ -4418,6 +4484,269 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		// New ticket dialog
 		// ------------------------------------------------------------------
 
+		// ------------------------------------------------------------------
+		// Thought intake (KB-1): Speak-a-thought dialog + Thoughts drawer
+		// ------------------------------------------------------------------
+
+		const THOUGHT_STATUSES = ['recorded', 'working', 'done', 'failed']
+
+		/** Localized status text; status is always conveyed by words, never colour alone. */
+		function thoughtStatusLabel(status, t) {
+			const value = safeString(status)
+			return t('thought.status.' + (THOUGHT_STATUSES.indexOf(value) === -1 ? 'recorded' : value))
+		}
+
+		function ThoughtDialog(props) {
+			const { t, onSubmit, onClose } = props
+			const textareaRef = useRef(null)
+			const dialogRef = useRef(null)
+			const [text, setText] = useState('')
+			const [submitting, setSubmitting] = useState(false)
+
+			useEscape(true, onClose)
+			useFocusOnOpen(true, textareaRef)
+
+			const trimmed = text.trim()
+			const canSend = trimmed !== '' && !submitting
+
+			const submit = async () => {
+				if (!canSend) return
+				setSubmitting(true)
+				const result = await onSubmit(trimmed)
+				setSubmitting(false)
+				// A failed submit keeps the dialog (and the typed text) open.
+				if (result && result.ok) onClose()
+			}
+
+			// Trapped-lite: Tab cycles inside the dialog, Escape closes and focus restores.
+			const onKeyDown = (event) => {
+				if (event.key !== 'Tab') return
+				const node = dialogRef.current
+				if (!node) return
+				const focusable = [...node.querySelectorAll('textarea,button,input,select,a[href]')].filter(
+					(item) => item.disabled !== true && item.getBoundingClientRect().width > 0,
+				)
+				if (focusable.length === 0) return
+				const first = focusable[0]
+				const last = focusable[focusable.length - 1]
+				if (event.shiftKey && document.activeElement === first) {
+					event.preventDefault()
+					last.focus()
+				} else if (!event.shiftKey && document.activeElement === last) {
+					event.preventDefault()
+					first.focus()
+				}
+			}
+
+			return h(
+				'div',
+				{ className: 'kb-overlay kb-overlay--center', onClick: onClose },
+				h(
+					'div',
+					{
+						ref: dialogRef,
+						className: 'kb-dialog',
+						role: 'dialog',
+						'aria-modal': 'true',
+						'aria-label': t('thought.title'),
+						onKeyDown,
+						onClick: (event) => event.stopPropagation(),
+					},
+					h(
+						'div',
+						{ className: 'kb-dialogHead' },
+						h('span', { className: 'kb-dialogTitle' }, t('thought.title')),
+						h(
+							'button',
+							{
+								type: 'button',
+								className: 'kb-btn kb-btn--ghost kb-btn--icon',
+								title: t('header.close'),
+								'aria-label': t('header.close'),
+								onClick: onClose,
+							},
+							h(IconClose, { size: 15 }),
+						),
+					),
+					h(
+						'div',
+						{ className: 'kb-dialogBody' },
+						h(
+							'label',
+							{ className: 'kb-field', htmlFor: 'kb-thought-input' },
+							h('span', { className: 'kb-fieldLabel' }, t('thought.field')),
+							h('textarea', {
+								id: 'kb-thought-input',
+								ref: textareaRef,
+								className: 'kb-textarea',
+								value: text,
+								rows: 6,
+								maxLength: 4000,
+								placeholder: t('thought.placeholder'),
+								'aria-label': t('thought.field'),
+								onChange: (event) => setText(event.target.value),
+								onKeyDown: (event) => {
+								if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+									event.preventDefault()
+									void submit()
+								}
+							},
+							}),
+							text.length > 3600 ? h('span', { className: 'kb-thoughtCounter' }, text.length + '/4000') : null,
+						),
+					),
+					h(
+						'div',
+						{ className: 'kb-dialogFoot' },
+						h(Button, { variant: 'ghost', onClick: onClose }, t('actions.cancel')),
+						h(
+							Button,
+							{
+								variant: 'primary',
+								disabled: !canSend,
+								icon: submitting ? h(Spinner) : h(IconSparkles, { size: 14 }),
+								onClick: () => void submit(),
+							},
+							submitting ? t('thought.sending') : t('thought.send'),
+						),
+					),
+				),
+			)
+		}
+
+		function ThoughtRowView(props) {
+			const { t, thought, expanded, onToggle, onOpenTicket, openSession } = props
+			const text = safeString(thought.text)
+			const status = safeString(thought.status)
+			const errorText = safeString(thought.error)
+			const chips = safeArray(thought.ticketIds).filter((id) => typeof id === 'string' && id)
+			const expandable = text.length > 160
+			const statusKey = THOUGHT_STATUSES.indexOf(status) === -1 ? 'recorded' : status
+			return h(
+				'div',
+				{ className: 'kb-thoughtRow' },
+				h(
+					'div',
+					{ className: 'kb-thoughtTop' },
+					h('span', { className: 'kb-thoughtStatus kb-thoughtStatus--' + statusKey }, thoughtStatusLabel(status, t)),
+					h('span', { className: 'kb-thoughtAge' }, formatAge(safeNumber(thought.updatedAt, safeNumber(thought.createdAt, 0)), t)),
+				),
+				h('div', { className: classNames('kb-thoughtText', expanded === true && 'kb-thoughtText--expanded') }, text),
+				expandable
+					? h(
+							'button',
+							{ type: 'button', className: 'kb-thoughtExpand', onClick: onToggle, 'aria-expanded': expanded === true ? 'true' : 'false' },
+							expanded === true ? t('thought.collapse') : t('thought.expand'),
+						)
+					: null,
+				status === 'failed' && errorText ? h('div', { className: 'kb-thoughtError' }, errorText) : null,
+				chips.length > 0 || thought.sessionId
+					? h(
+							'div',
+							{ className: 'kb-thoughtMeta' },
+							chips.map((ticketId) =>
+								h(
+									'button',
+									{
+										key: ticketId,
+										type: 'button',
+										className: 'kb-thoughtChip',
+										title: ticketId,
+										'aria-label': ticketId,
+										onClick: () => onOpenTicket(ticketId),
+									},
+									ticketId,
+								),
+							),
+							thought.sessionId
+								? h(
+										Button,
+										{
+											size: 'sm',
+											variant: 'ghost',
+											icon: h(IconExternal, { size: 12 }),
+											title: t('execution.openSession'),
+											onClick: () => openSession(thought.sessionId),
+										},
+										t('execution.openSession'),
+									)
+								: null,
+						  )
+					: null,
+			)
+		}
+
+		function ThoughtsDrawer(props) {
+			const { t, thoughts, onOpenTicket, openSession, onClose } = props
+			const closeRef = useRef(null)
+			const [expanded, setExpanded] = useState({})
+			useEscape(true, onClose)
+			useFocusOnOpen(true, closeRef)
+			const rows = safeArray(thoughts).filter((thought) => thought && typeof thought.id === 'string' && thought.id)
+			return h(
+				'div',
+				{ className: 'kb-overlay kb-overlay--right', onClick: onClose },
+				h(
+					'div',
+					{
+						className: 'kb-drawer kb-drawer--thoughts',
+						role: 'dialog',
+						'aria-modal': 'true',
+						'aria-label': t('header.thoughts'),
+						onClick: (event) => event.stopPropagation(),
+					},
+					h(
+						'div',
+						{ className: 'kb-drawerHead' },
+						h(
+							'div',
+							{ className: 'kb-drawerHeadMain' },
+							h('span', { className: 'kb-drawerId' }, t('header.thoughts')),
+							rows.length > 0 ? h('span', { className: 'kb-thoughtsHeadCount' }, t('thought.count', { n: rows.length })) : null,
+						),
+						h(
+							'button',
+							{
+								ref: closeRef,
+								type: 'button',
+								className: 'kb-btn kb-btn--ghost kb-btn--icon',
+								title: t('thought.close'),
+								'aria-label': t('thought.close'),
+								onClick: onClose,
+							},
+							h(IconClose, { size: 15 }),
+						),
+					),
+					h(
+						'div',
+						{ className: 'kb-drawerBody' },
+						rows.length === 0
+							? h(
+									'div',
+									{ className: 'kb-thoughtEmpty' },
+									h('span', { className: 'kb-thoughtEmptyIcon' }, h(IconSparkles, { size: 22 })),
+									h('span', null, t('thought.empty')),
+								)
+							: h(
+									'div',
+									{ className: 'kb-thoughtsList' },
+									rows.map((thought) =>
+										h(ThoughtRowView, {
+											key: thought.id,
+											t,
+											thought,
+											expanded: expanded[thought.id] === true,
+											onToggle: () => setExpanded((previous) => ({ ...previous, [thought.id]: !previous[thought.id] })),
+											onOpenTicket,
+											openSession,
+										}),
+									),
+								),
+					),
+				),
+			)
+		}
+
 		function NewTicketDialog(props) {
 			const { t, roles, initialColumn, onCreate, onClose } = props
 			const inputRef = useRef(null)
@@ -4885,6 +5214,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const [memberEditor, setMemberEditor] = useState(null)
 			const [rolesOpen, setRolesOpen] = useState(false)
 			const [scan, setScan] = useState(emptyScanState)
+			const [thoughtOpen, setThoughtOpen] = useState(false)
+			const [thoughtsOpen, setThoughtsOpen] = useState(false)
 			const [drag, setDrag] = useState(null)
 			const [dragOver, setDragOver] = useState(null)
 			const bootedRef = useRef(false)
@@ -4904,6 +5235,19 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const closeDrawer = useCallback(() => setSelectedId(null), [])
 			const closeNewTicket = useCallback(() => setNewTicket(null), [])
 			const closeScan = useCallback(() => setScan(emptyScanState()), [])
+			const thoughtCtaRef = useRef(null)
+			const closeThought = useCallback(() => {
+				setThoughtOpen(false)
+				// End-to-end focus order: closing the dialog always returns focus to
+				// the control that opens it (also covers programmatic open paths).
+				// Deferred one tick so the dialog's own focus-restore cleanup cannot
+				// steal focus back after unmount.
+				window.setTimeout(() => {
+					const node = thoughtCtaRef.current
+					if (node && typeof node.focus === 'function') node.focus()
+				}, 0)
+			}, [])
+			const closeThoughts = useCallback(() => setThoughtsOpen(false), [])
 			const closeMemberEditor = useCallback(() => setMemberEditor(null), [])
 			const closeRoles = useCallback(() => setRolesOpen(false), [])
 			const openNewMember = useCallback(() => setMemberEditor({ memberId: null }), [])
@@ -5020,6 +5364,15 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				if (!snapshot || !Array.isArray(snapshot.drafts)) return []
 				return snapshot.drafts.filter((draft) => draft && typeof draft.id === 'string' && draft.id)
 			}, [snapshot])
+			// KB-1 thoughts are additive: an older snapshot simply has none.
+			const thoughts = useMemo(() => {
+				if (!snapshot || !Array.isArray(snapshot.thoughts)) return []
+				return snapshot.thoughts.filter((thought) => thought && typeof thought.id === 'string' && thought.id)
+			}, [snapshot])
+			const workingThoughts = useMemo(
+				() => thoughts.filter((thought) => thought.status === 'working').length,
+				[thoughts],
+			)
 			const roleCatalog = useMemo(() => {
 				const fromRules = safeArray(rules.roles).filter((role) => role && typeof role.id === 'string' && role.id)
 				const source = fromRules.length > 0 ? fromRules : ROLE_IDS.map((id) => ({ id }))
@@ -5216,6 +5569,20 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					return result
 				},
 				[act],
+			)
+
+			// The dialog owns the typed text: a failed submit keeps it, only `ok` closes.
+			const submitThoughtAction = useCallback(
+				(text) => act('submitThought', { text }, { key: 'submitThought' }),
+				[act],
+			)
+
+			const openThoughtTicket = useCallback(
+				(ticketId) => {
+					setThoughtsOpen(false)
+					openTicket(ticketId)
+				},
+				[openTicket],
 			)
 
 			const toggleAgent = useCallback(
@@ -5730,6 +6097,36 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 										})
 									: null,
 							),
+							// Everything after the filters is a board action: the Thoughts
+							// drawer and the single primary entry point sit immediately
+							// before the ticket actions.
+							h(
+								Button,
+								{
+									variant: 'ghost',
+									className: thoughtsOpen ? 'kb-btn--active' : undefined,
+									icon: h(IconList, { size: 14 }),
+									title: t('header.thoughts'),
+									pressed: thoughtsOpen,
+									disabled: !board,
+									onClick: () => setThoughtsOpen((value) => !value),
+								},
+								h('span', { className: 'kb-btnLabel kb-btnLabel--secondary' }, t('header.thoughts')),
+								workingThoughts > 0 ? h('span', { className: 'kb-btnBadge' }, String(workingThoughts)) : null,
+							),
+							h(
+								Button,
+								{
+									variant: 'primary',
+									icon: h(IconSparkles, { size: 14 }),
+									title: paused ? t('thought.pausedHint') : t('header.speakThought'),
+									'aria-label': t('header.speakThought'),
+									buttonRef: thoughtCtaRef,
+									disabled: !canEdit || !board,
+									onClick: () => setThoughtOpen(true),
+								},
+								h('span', { className: 'kb-btnLabel' }, t('header.speakThought')),
+							),
 							h(
 								Button,
 								{
@@ -5744,7 +6141,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							h(
 								Button,
 								{
-									variant: 'primary',
+									variant: 'ghost',
 									icon: h(IconPlus, { size: 14 }),
 									title: t('header.newTicket'),
 									disabled: !canEdit,
@@ -5930,6 +6327,13 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									onClose: closeNewTicket,
 								})
 							: null,
+						thoughtOpen
+							? h(ThoughtDialog, {
+									t,
+									onSubmit: submitThoughtAction,
+									onClose: closeThought,
+								})
+							: null,
 						scan.open
 							? h(ScanDrawer, {
 									t,
@@ -5939,6 +6343,15 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									onToggleCandidate: toggleCandidate,
 									onToggleAll: toggleAllCandidates,
 									onRetry: runScan,
+								})
+							: null,
+						thoughtsOpen
+							? h(ThoughtsDrawer, {
+									t,
+									thoughts,
+									onOpenTicket: openThoughtTicket,
+									openSession: notifyOpenSession,
+									onClose: closeThoughts,
 								})
 							: null,
 					),
