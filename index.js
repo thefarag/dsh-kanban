@@ -65,6 +65,18 @@ const PERSONA_MAX = 6000;
 const MEMBER_NAME_MAX = 48;
 const MEMBER_TITLE_MAX = 60;
 const MEMBER_DRAFT_DESCRIPTION_MAX = 1000;
+// Thought intake (KB-1): a separate per-workspace store so the board schema
+// stays v2. The record shape below is the whole public contract.
+const THOUGHT_VERSION = 1;
+const THOUGHT_TEXT_MAX = 4000;
+const THOUGHT_WORKING_LIMIT = 3;
+const THOUGHT_SNAPSHOT_MAX = 50;
+const THOUGHT_GRACE_MS = 30 * 1000;
+const THOUGHT_STATUSES = ['recorded', 'working', 'done', 'failed'];
+// A thought-dispatch session may read and create Backlog tickets, nothing else.
+const THOUGHT_TOOL_ACTIONS = new Set([
+  'whoami', 'projects', 'board', 'list', 'next', 'team', 'members', 'create',
+]);
 
 const COLUMNS = [
   { id: 'backlog', title: 'Backlog', order: 0 },
@@ -298,6 +310,60 @@ function reconcileDrafts(board) {
   return timedOut;
 }
 
+// ---------------------------------------------------------------------------
+// Thought records (KB-1)
+// ---------------------------------------------------------------------------
+
+/** The public ThoughtRow shape. Nothing implementation-only leaks into it. */
+function normalizeThought(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (typeof raw.id !== 'string' || !/^TH-\d+$/.test(raw.id)) return null;
+  const text = typeof raw.text === 'string' ? raw.text.trim().slice(0, THOUGHT_TEXT_MAX) : '';
+  if (!text) return null;
+  const status = THOUGHT_STATUSES.includes(raw.status) ? raw.status : 'failed';
+  const createdAt = Number.isFinite(raw.createdAt) ? raw.createdAt : now();
+  const ticketIds = [];
+  for (const entry of Array.isArray(raw.ticketIds) ? raw.ticketIds : []) {
+    if (typeof entry !== 'string' || !entry || ticketIds.includes(entry)) continue;
+    ticketIds.push(entry);
+  }
+  return {
+    id: raw.id,
+    text,
+    status,
+    createdAt,
+    updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : createdAt,
+    sessionId: typeof raw.sessionId === 'string' && raw.sessionId ? raw.sessionId : null,
+    error: typeof raw.error === 'string' ? raw.error.slice(0, 2000) : '',
+    ticketIds,
+  };
+}
+
+function emptyThoughtState() {
+  return { version: THOUGHT_VERSION, nextNumber: 1, thoughts: [] };
+}
+
+/** Tolerant read: anything unparseable degrades to an empty thought list. */
+function normalizeThoughtState(raw) {
+  const state = emptyThoughtState();
+  if (!raw || typeof raw !== 'object') return state;
+  const seen = new Set();
+  for (const entry of Array.isArray(raw.thoughts) ? raw.thoughts : []) {
+    const thought = normalizeThought(entry);
+    if (!thought || seen.has(thought.id)) continue;
+    seen.add(thought.id);
+    state.thoughts.push(thought);
+  }
+  let highest = 0;
+  for (const thought of state.thoughts) {
+    const number = Number(thought.id.slice(3));
+    if (number > highest) highest = number;
+  }
+  state.nextNumber =
+    Number.isInteger(raw.nextNumber) && raw.nextNumber > highest ? raw.nextNumber : highest + 1;
+  return state;
+}
+
 function newBoard(project, wip) {
   const at = now();
   const board = {
@@ -464,6 +530,8 @@ function normalizeTicket(raw) {
     column: COLUMN_IDS.includes(raw?.column) ? raw.column : 'backlog',
     role: ALL_ROLES.includes(raw?.role) ? raw.role : null,
     labels: Array.isArray(raw?.labels) ? raw.labels.filter((label) => typeof label === 'string').slice(0, 12) : [],
+    // Additive KB-1 field: present only on tickets a thought dispatch created.
+    ...(typeof raw?.thoughtId === 'string' && raw.thoughtId ? { thoughtId: raw.thoughtId.slice(0, 40) } : {}),
     owner: raw?.owner && typeof raw.owner === 'object' && typeof raw.owner.sessionId === 'string'
       ? {
           sessionId: raw.owner.sessionId,
@@ -594,6 +662,65 @@ class BoardStore {
   }
 }
 
+/**
+ * Per-workspace thought store: one file per workspace under `<stateDir>/thoughts/`,
+ * atomic replace, serialized writes, tolerant read. Kept apart from the board so
+ * the board schema stays v2 and an old board never needs a migration for intake.
+ */
+class ThoughtStore {
+  constructor(dir) {
+    this.dir = dir;
+    this.cache = new Map();
+    this.pending = new Map();
+    this.errors = new Map();
+  }
+
+  file(workspaceId) {
+    return join(this.dir, `${safeFileName(workspaceId)}.json`);
+  }
+
+  async get(project) {
+    if (this.cache.has(project.id)) return this.cache.get(project.id);
+    let raw = null;
+    try {
+      raw = JSON.parse(await readFile(this.file(project.id), 'utf8'));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.errors.set(project.id, error instanceof Error ? error.message : String(error));
+        try {
+          await rename(this.file(project.id), `${this.file(project.id)}.corrupt-${now()}`);
+        } catch {
+          // best effort: a corrupt thought file is replaced, never fatal
+        }
+      }
+    }
+    // A corrupt file leaves raw null, and normalizeThoughtState degrades to [].
+    const state = normalizeThoughtState(raw);
+    this.cache.set(project.id, state);
+    return state;
+  }
+
+  async save(project, state) {
+    const workspaceId = project.id;
+    const previous = this.pending.get(workspaceId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await mkdir(this.dir, { recursive: true });
+        const target = this.file(workspaceId);
+        const temp = `${target}.tmp-${process.pid}-${now()}`;
+        await writeFile(temp, JSON.stringify(state, null, 0), 'utf8');
+        await rename(temp, target);
+        this.errors.delete(workspaceId);
+      })
+      .catch((error) => {
+        this.errors.set(workspaceId, error instanceof Error ? error.message : String(error));
+      });
+    this.pending.set(workspaceId, next);
+    return next;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Host plugin
 // ---------------------------------------------------------------------------
@@ -604,6 +731,12 @@ export function apply(ctx, config = {}) {
     ? settings.stateDir
     : join(dshHome(), 'kanban');
   const store = new BoardStore(stateDir, defaultWip(settings));
+  const thoughtStore = new ThoughtStore(join(stateDir, 'thoughts'));
+  // Live dispatch grace is 30 s; tests may shrink it with the config knob.
+  const thoughtGraceMs =
+    Number.isInteger(settings.thoughtGraceMs) && settings.thoughtGraceMs > 0
+      ? settings.thoughtGraceMs
+      : THOUGHT_GRACE_MS;
   const lastScans = new Map();
   let sessionsCache = { at: 0, items: [] };
 
@@ -1073,6 +1206,7 @@ export function apply(ctx, config = {}) {
         roster: [],
         drafts: [],
         sessions: [],
+        thoughts: [],
         rules: rulesSnapshot(),
         lastScan: null,
       };
@@ -1081,6 +1215,8 @@ export function apply(ctx, config = {}) {
     const project = projectFor(workspaceId, sessionsForDefault);
     const board = await store.ensure(project);
     await reconcileExecutions(board);
+    await reconcileThoughts(project);
+    const thoughts = await thoughtRows(project);
     const { rows, sessions } = await snapshotTeam(project, board);
     // A session that joined through Agent Teams adopts the roster member it
     // names; persist that link so the roster sees it on the next read.
@@ -1115,6 +1251,7 @@ export function apply(ctx, config = {}) {
       team: rows,
       roster,
       drafts,
+      thoughts,
       sessions,
       rules: rulesSnapshot(),
       accessModes: { options: accessOptions(), suggestions: accessSuggestions() },
@@ -1257,6 +1394,8 @@ export function apply(ctx, config = {}) {
       labels: Array.isArray(input.labels)
         ? input.labels.filter((label) => typeof label === 'string').slice(0, 12)
         : [],
+      // Additive KB-1 linkage: tickets created by a thought dispatch carry its id.
+      ...(typeof input.thoughtId === 'string' && input.thoughtId ? { thoughtId: input.thoughtId.slice(0, 40) } : {}),
       owner: null,
       blocked: false,
       blockReason: '',
@@ -1961,6 +2100,245 @@ export function apply(ctx, config = {}) {
     const board = await store.ensure(project);
     return { project, board };
   }
+
+  // -- thought intake (KB-1) ----------------------------------------------
+
+  /** Snapshot row: exactly the frozen public ThoughtRecord shape. */
+  function thoughtRow(thought) {
+    return {
+      id: thought.id,
+      text: thought.text,
+      status: thought.status,
+      createdAt: thought.createdAt,
+      updatedAt: thought.updatedAt,
+      sessionId: thought.sessionId,
+      error: thought.error,
+      ticketIds: [...thought.ticketIds],
+    };
+  }
+
+  async function loadThoughts(project) {
+    return thoughtStore.get(project);
+  }
+
+  async function thoughtRows(project) {
+    const state = await loadThoughts(project);
+    // Newest first, max 50: the file keeps creation order (append-only).
+    return state.thoughts.slice(-THOUGHT_SNAPSHOT_MAX).reverse().map(thoughtRow);
+  }
+
+  /** Is the dispatched session observable, and is it running? */
+  async function sessionObservation(sessionId) {
+    const sessions = await readSessions();
+    const summary = sessions.find((session) => session.sessionId === sessionId);
+    if (summary) return { observed: true, running: summary.running === true };
+    let agent;
+    try {
+      agent = ctx.get('agents')?.get?.(sessionId);
+    } catch {
+      agent = undefined;
+    }
+    if (agent) return { observed: true, running: agent.status === 'running' };
+    return { observed: false, running: false };
+  }
+
+  /**
+   * Snapshot-read reconciliation, idempotent:
+   *   observed + running -> working (no write)
+   *   observed, not running -> done (write once)
+   *   never observed -> working until the grace elapses, then failed
+   * A `recorded` thought whose dispatch never completed gets the same failure.
+   */
+  async function reconcileThoughts(project) {
+    const state = await loadThoughts(project);
+    const at = now();
+    let changed = false;
+    for (const thought of state.thoughts) {
+      if (thought.status === 'recorded') {
+        if (at - thought.updatedAt > thoughtGraceMs) {
+          thought.status = 'failed';
+          thought.error = 'the product manager session did not start';
+          thought.updatedAt = at;
+          changed = true;
+        }
+        continue;
+      }
+      if (thought.status !== 'working' || !thought.sessionId) continue;
+      const observation = await sessionObservation(thought.sessionId);
+      if (observation.running) continue;
+      if (observation.observed) {
+        thought.status = 'done';
+        thought.updatedAt = at;
+        changed = true;
+      } else if (at - thought.updatedAt > thoughtGraceMs) {
+        thought.status = 'failed';
+        thought.error = 'the product manager session did not start';
+        thought.updatedAt = at;
+        changed = true;
+      }
+    }
+    if (changed) await thoughtStore.save(project, state);
+    return state;
+  }
+
+  function thoughtExcerpt(text) {
+    return String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  }
+
+  function thoughtPrompt(project, thought, member) {
+    const role = ROLE_INDEX['product-manager'];
+    const composition = composeAgentPrompt({ role, member: member ?? null });
+    return [
+      `# Thought intake — ${thought.id}`,
+      `Project: ${project.title} (${project.path})`,
+      'You are the staff product manager for this thought. The human captured it; you turn it into real Kanban tickets in Backlog.',
+      composition ? `\n${composition}` : '',
+      '',
+      '## The thought (verbatim)',
+      thought.text,
+      '',
+      '## Rules',
+      '1. Read the board first (`board`, `list`) and whatever project docs you need.',
+      '2. Decompose into 1–20 independently shippable tickets; choose type (`story`/`task`/`bug`/`spike`), priority, role and labels that match the work; description must carry numbered, testable acceptance criteria and a short evidence plan.',
+      '3. Create every ticket with the kanban `create` action, in Backlog only. Do not move, claim, update, release, comment on or finish existing tickets. Do not write code or files.',
+      '4. Research the project; use the web only when the thought needs an external standard or best practice, and say what you relied on.',
+      '5. Do not create an EPIC in this slice; state in your closing message whether one will be needed.',
+      '6. Finish with a short summary of created ticket ids and anything deliberately left out.',
+      '',
+      '## Session contract',
+      'This session is read-only on the workspace and tool-scoped: only read actions and `create` are allowed, and every created ticket lands in Backlog. If the tool rejects an action with `kanban/thought-read-only`, that is expected.',
+    ].filter(Boolean).join('\n');
+  }
+
+  /** Staff-PM dispatch: one project-preset session, read-only, PM persona, task brief. */
+  async function dispatchThought(project, board, thought) {
+    const preset = await executionPreset(project);
+    const sessionId = `session-${randomUUID()}`;
+    let modelSelection;
+    try {
+      modelSelection = ctx.get('agentDefaultModel')?.currentSelection?.();
+    } catch {
+      modelSelection = undefined;
+    }
+    const agentOptions =
+      modelSelection && typeof modelSelection.provider === 'string' && typeof modelSelection.model === 'string'
+        ? {
+            provider: modelSelection.provider,
+            model: modelSelection.model,
+            ...(typeof modelSelection.reasoningEffort === 'string' ? { reasoningEffort: modelSelection.reasoningEffort } : {}),
+          }
+        : undefined;
+    let handle;
+    try {
+      handle = await ctx.agents.create({
+        sessionId,
+        meta: {
+          cwd: project.path,
+          ...(preset.id ? { agentPreset: preset.id } : {}),
+        },
+        ...(agentOptions ? { agentOptions } : {}),
+        ...(preset.mount ? { setup: async (agentCtx) => { await preset.mount(agentCtx); } } : {}),
+      });
+    } catch (error) {
+      throw new ApiError(502, 'thought/session-failed', `Could not start an agent session: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const agentId = String(handle.agent.id);
+    const member =
+      board.team.members.find((candidate) => candidate.roleId === 'product-manager' && !candidate.paused) ??
+      board.team.members.find((candidate) => candidate.roleId === 'product-manager') ??
+      null;
+    try {
+      const presets = ctx.get('permissionPresets');
+      const liveSession = handle.agent?.session ?? ctx.get('sessions')?.get?.(agentId);
+      if (presets && typeof presets.set === 'function' && liveSession) {
+        presets.set(liveSession, readOnlyAccessValue());
+      }
+      await project.attachSession?.(agentId);
+      try {
+        const live = ctx.get('sessions')?.get?.(agentId);
+        const titles = ctx.get('sessionTitle');
+        if (live && titles && typeof titles.rename === 'function') {
+          titles.rename(live, `Thought ${thought.id} · ${thoughtExcerpt(thought.text)}`.slice(0, 120));
+        }
+      } catch {
+        // title is cosmetic; never fail the dispatch over it
+      }
+      ensureBoardAgent(board, agentId, { name: member?.name ?? 'Product Manager', role: 'product-manager' });
+      await promptSession(agentId, thoughtPrompt(project, thought, member));
+      return agentId;
+    } catch (error) {
+      // No partial linkage: drop the in-memory agent entry and stop the session.
+      delete board.agents[agentId];
+      try {
+        ctx.sessionController?.cancel?.({ sessionId: agentId });
+      } catch {
+        // best effort
+      }
+      try {
+        await handle?.dispose?.();
+      } catch {
+        // best effort
+      }
+      throw error instanceof ApiError
+        ? error
+        : new ApiError(502, 'thought/prompt-failed', `The product manager session started but the prompt was rejected: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function submitThought({ workspaceId, text }) {
+    if (typeof text !== 'string') throw badRequest('Thought text must be a string.');
+    const trimmed = text.trim();
+    if (!trimmed) throw new ApiError(400, 'thought/empty', 'Type a thought before sending it.');
+    if (trimmed.length > THOUGHT_TEXT_MAX) {
+      throw new ApiError(400, 'thought/too-long', `A thought is limited to ${THOUGHT_TEXT_MAX} characters.`);
+    }
+    const { project, board } = await loadProject(workspaceId);
+    if (board.paused) {
+      throw new ApiError(423, 'board/paused', 'The board is paused. Resume it to capture a thought.');
+    }
+    const state = await loadThoughts(project);
+    const working = state.thoughts.filter((thought) => thought.status === 'working').length;
+    if (working >= THOUGHT_WORKING_LIMIT) {
+      throw new ApiError(
+        409,
+        'thought/limit',
+        `${THOUGHT_WORKING_LIMIT} thoughts are already being processed. Wait for one to finish before adding another.`,
+      );
+    }
+    const at = now();
+    const number = Number.isInteger(state.nextNumber) && state.nextNumber > 0 ? state.nextNumber : 1;
+    state.nextNumber = number + 1;
+    const thought = {
+      id: `TH-${number}`,
+      text: trimmed,
+      status: 'recorded',
+      createdAt: at,
+      updatedAt: at,
+      sessionId: null,
+      error: '',
+      ticketIds: [],
+    };
+    state.thoughts.push(thought);
+    await thoughtStore.save(project, state);
+    try {
+      const sessionId = await dispatchThought(project, board, thought);
+      thought.status = 'working';
+      thought.sessionId = sessionId;
+      thought.updatedAt = now();
+      await thoughtStore.save(project, state);
+      // Persist only the additive agent registry entry, never board.thoughts.
+      await store.save(board);
+      return { thought: thoughtRow(thought) };
+    } catch (error) {
+      thought.status = 'failed';
+      thought.sessionId = null;
+      thought.error = error instanceof Error ? error.message : String(error);
+      thought.updatedAt = now();
+      await thoughtStore.save(project, state);
+      return { thought: thoughtRow(thought) };
+    }
+  }
+
 
   function requireUserMoveContext(board, user) {
     if (!user && board.paused) {
@@ -3101,6 +3479,8 @@ export function apply(ctx, config = {}) {
     const allowedWhilePaused = new Set([
       'pauseBoard', 'resumeBoard', 'pauseAgent', 'resumeAgent', 'setAgentRole', 'scan', 'refresh',
       'createMember', 'updateMember', 'deleteMember', 'draftMember', 'cancelDraft', 'roleDetail', 'memberPrompt',
+      // Capturing a thought is rejected with its own thought-aware 423 copy.
+      'submitThought',
     ]);
     if (!allowedWhilePaused.has(action)) {
       const { board } = await loadProject(workspaceId);
@@ -3137,6 +3517,8 @@ export function apply(ctx, config = {}) {
         });
       case 'cancelExecution':
         return cancelTicketExecution({ workspaceId, ticketId: String(payload?.ticketId ?? ''), actor: 'You' });
+      case 'submitThought':
+        return submitThought({ workspaceId, text: payload?.text });
       case 'createTicket': {
         const { board } = await loadProject(workspaceId);
         const ticket = createTicketRecord(board, payload ?? {}, 'You');
@@ -3463,6 +3845,20 @@ export function apply(ctx, config = {}) {
       throw toolError('unresolved', error instanceof Error ? error.message : String(error));
     }
     const projectView = { id: String(project.id), title: project.title, path: project.path };
+    // Thought-dispatch guardrail (KB-1): a session linked to a thought may only
+    // read and create Backlog tickets. Resolved before execution scoping so a
+    // thought session can never borrow execution privileges.
+    const callerThoughtState = await loadThoughts(project);
+    const callerThought =
+      callerThoughtState.thoughts.find(
+        (thought) => thought.sessionId && thought.sessionId === actor.sessionId,
+      ) ?? null;
+    if (callerThought && !THOUGHT_TOOL_ACTIONS.has(action)) {
+      throw toolError(
+        'thought-read-only',
+        `This session is scoped to ${callerThought.id}: only read actions and creating Backlog tickets are allowed.`,
+      );
+    }
     const scopedTicket = board.tickets.find(
       (ticket) =>
         ticket.execution?.sessionId === actor.sessionId &&
@@ -3512,6 +3908,7 @@ export function apply(ctx, config = {}) {
       priority: ticket.priority,
       column: ticket.column,
       role: ticket.role,
+      thoughtId: ticket.thoughtId ?? null,
       owner: ticket.owner ? { name: ticket.owner.name, sessionId: ticket.owner.sessionId } : null,
       assignment: ticket.assignment ? { role: ticket.assignment.role, accessMode: ticket.assignment.accessMode, agentName: ticket.assignment.agentName, auto: ticket.assignment.auto } : null,
       executionStatus: ticket.execution?.status ?? null,
@@ -3632,9 +4029,11 @@ export function apply(ctx, config = {}) {
       }
       case 'create': {
         requireBoardActive();
-        if (actor.role !== 'product-manager' && actor.role !== 'tech-lead' && !actor.isLead) {
+        if (!callerThought && actor.role !== 'product-manager' && actor.role !== 'tech-lead' && !actor.isLead) {
           throw toolError('role-forbidden', 'Only the product manager or tech lead creates new tickets; raise a comment on an existing ticket instead.');
         }
+        // A thought session always creates in Backlog, whatever it asked for,
+        // and the ticket is stamped with the owning thought.
         const ticket = createTicketRecord(
           board,
           {
@@ -3642,12 +4041,17 @@ export function apply(ctx, config = {}) {
             description: args.description,
             type: args.type,
             priority: args.priority,
-            column: args.column ?? 'backlog',
+            column: callerThought ? 'backlog' : (args.column ?? 'backlog'),
             role: args.role,
             labels: args.labels,
+            ...(callerThought ? { thoughtId: callerThought.id } : {}),
           },
           actor.name,
         );
+        if (callerThought && !callerThought.ticketIds.includes(ticket.id)) {
+          callerThought.ticketIds.push(ticket.id);
+          await thoughtStore.save(project, callerThoughtState);
+        }
         await store.save(board);
         return { summary: `Created ${ticket.id}: ${ticket.title}`, ticket: brief(ticket) };
       }
