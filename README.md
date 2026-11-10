@@ -14,20 +14,20 @@ versioned snapshot changes are recorded in [KANBAN_SPEC.md](KANBAN_SPEC.md).
 
 ## Install
 
-This project lives at `/Users/thefarag/Projects/AI/AI_Generated/HDS-Kanban` and is its own DSH
+This project lives at `/Users/thefarag/Projects/AI/AI_Generated/DSH-Kanban` and is its own DSH
 Workspace. It is linked into the DSH profile (`~/.dsh/profiles/desktop`) as a local bundle, so the
 running Host resolves `@local/dsh-kanban` straight from this directory:
 
 ```jsonc
 // ~/.dsh/profiles/desktop/package.json
-"dependencies": { "@local/dsh-kanban": "link:/Users/thefarag/Projects/AI/AI_Generated/HDS-Kanban" }
+"dependencies": { "@local/dsh-kanban": "link:/Users/thefarag/Projects/AI/AI_Generated/DSH-Kanban" }
 ```
 
 To point another machine or profile at a checkout:
 
 ```
 # in the DSH chat, ask the agent to install the bundle, or use the Plugins UI
-plugin_manager install_bundle target=/absolute/path/to/HDS-Kanban
+plugin_manager install_bundle target=/absolute/path/to/DSH-Kanban
 ```
 
 Then refresh the Web GUI once. The bundle patch inserts one row:
