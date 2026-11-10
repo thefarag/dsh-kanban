@@ -60,6 +60,12 @@ Then refresh the Web GUI once. The bundle patch inserts one row:
    linked to a roster member) and **Role playbooks**. Pause or resume a member, edit their
    name/title/role/persona, or pause the whole board (running agent turns are cancelled).
 
+**The primary entry point is a thought.** Press **Speak a thought** (说出想法) in the board header, type
+one thought, and send it. A read-only product-manager agent session decomposes it into Backlog tickets.
+The **Thoughts** button (badge = working count) opens a drawer with each thought's status,
+created-ticket chips and **Open agent session**. While the board is paused, capture is rejected
+(`423 board/paused`) — resume first. **+ New ticket** is now a secondary, ghost-style action.
+
 ## Team members and personas
 
 Every project board gets a persisted roster of **team members**. A member is a person: a name, a title,
@@ -290,10 +296,13 @@ node tests/scoping.test.mjs               # nested-workspace ownership, default 
 node tests/execution.test.mjs             # dispatch, scoped tool, block/answer, finish, cancel
 node tests/roles.test.mjs                 # role catalog rigor, playbooks, personas, prompt composition
 node tests/team.test.mjs                  # roster, migration, statuses, drafting, linkage, member actions
+node --test tests/thoughts.test.mjs       # thought intake: store, dispatch, guardrail, reconciliation
 node tests/client.test.mjs                # client module shape, locale coverage, slot registrations
 ```
 
 They run against temporary directories and a fake Harness context/client runtime.
+
+The thought-intake probe is `node tools/kb14-probe.js`; it writes its evidence to `docs/screenshots/kb14/`.
 
 ## Harness integration
 

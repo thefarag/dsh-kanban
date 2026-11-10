@@ -188,3 +188,74 @@ editable roster of team members whose personas compose into dispatch prompts.
   drafting + template fallback, linkage, RBAC, system prompt.
 - `node tools/kb13-probe.js` — headless Chrome over the real GUI; evidence in
   `docs/screenshots/kb13/` (`final-verification.json` + PNGs).
+
+## v2.1 — Thought intake (KB-1)
+
+A thought becomes the board's primary entry point: the user speaks one thought, a staff product-manager
+agent session decomposes it, and the result is real Backlog tickets. The release is additive — the board
+schema does not move.
+
+### Snapshot additions (additive)
+
+- `thoughts: ThoughtRow[]` on `POST kanban/state` — newest first, at most 50, `[]` when no workspace.
+- `ThoughtRow = { id: 'TH-<n>', text, status: 'recorded'|'working'|'done'|'failed', createdAt, updatedAt,
+  sessionId: string|null, error: string, ticketIds: string[] }`; `text` is trimmed once to 1–4000
+  characters and stored verbatim.
+- `Ticket.thoughtId` is the only board addition: the id of the thought that created the ticket, absent on
+  tickets created any other way. `thought.ticketIds` lists the created tickets in creation order.
+- **No board schema bump.** `VERSION` stays 2 and nothing is written to `board.thoughts`. Thoughts live in
+  `<stateDir>/thoughts/<sanitized-workspaceId>.json` as `{ version: 1, nextNumber, thoughts[] }` in
+  creation order, written atomically (tmp+rename) and read tolerantly (missing/corrupt → `[]`; a corrupt
+  file is set aside as `.corrupt-*`). `nextNumber` keeps ids stable across restarts.
+
+### Actions
+
+| action | payload | value |
+|---|---|---|
+| `submitThought` | `{text}` | `{thought: ThoughtRow}` |
+
+- Errors: non-string/missing text → 400 `bad-request`; empty after trim → 400 `thought/empty`; more than
+  4000 characters → 400 `thought/too-long` (the message names the 4000 cap); 3 `working` thoughts → 409
+  `thought/limit`; a paused board → 423 `board/paused` (thought-specific copy asking the user to resume).
+- The thought is persisted before dispatch. A dispatch failure is still a 200 with the recorded thought in
+  `failed`, its `error` filled in and `sessionId: null`; it is never lost and creates no tickets.
+
+### Dispatch and completion
+
+- `ctx.agents.create` with `meta.cwd = project.path`, the project's resolved agent preset id in
+  `meta.agentPreset`, and a `setup` mounting that preset.
+- The `read-only` permission preset is applied before prompting. The session is attached to the project,
+  recorded as the roster product manager (role `product-manager`, first unpaused PM's name), and renamed
+  `Thought TH-n · <first 60 characters>` (whitespace collapsed, whole title capped at 120).
+- Prompt = PM role playbook + seeded PM persona (role playbook only when no PM member exists) + brief:
+  the thought verbatim and six rules — read the board first; 1–20 independently shippable tickets with
+  type/priority/role/labels, numbered testable acceptance criteria and an evidence plan; create in Backlog
+  only and never move/claim/update/release/comment/finish/write code; research the project (and the web
+  only when external standards or best practice matter, saying what was relied on); no EPIC in this
+  slice, state whether one is needed; closing summary of created ids.
+- Linkage: `create` from the thought session forces `column: 'backlog'`, stamps `ticket.thoughtId`, and
+  appends the id to `thought.ticketIds` without duplicates.
+- Snapshot-read reconciliation (idempotent): session running → `working`; session observed but stopped →
+  `done` (`updatedAt` bumped once); session never observed → `failed` 30 s after dispatch, with error
+  exactly `the product manager session did not start` (tests use the `thoughtGraceMs` knob). `done` with
+  zero tickets is valid.
+
+### Tool restriction
+
+- A session tied to a thought may only call `whoami`, `projects`, `board`, `list`, `next`, `team`,
+  `members`, `create`; anything else fails with `kanban/thought-read-only` and mutates nothing.
+- Its `create` ignores `column`; sessions not tied to a thought are unchanged.
+
+### UI
+
+- Header primary **Speak a thought** (说出想法) opens a one-field dialog; **Thoughts** is the secondary
+  button with a badge counting `working` thoughts and a drawer listing status, created-ticket chips and
+  **Open agent session**. **+ New ticket** is demoted to a ghost action.
+- Capture on a paused board is refused with 423 `board/paused`; the board is otherwise unchanged.
+
+### Verification
+
+- `node --test tests/thoughts.test.mjs` — additive snapshot, validation/limits, dispatch capture
+  (cwd/preset/read-only/title/prompt), guardrail, linkage, failure paths, 30 s grace, persistence and
+  restart, tolerant reads, 50-row newest-first cap.
+- `node tools/kb14-probe.js` — headless Chrome over the real GUI; evidence in `docs/screenshots/kb14/`.
