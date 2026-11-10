@@ -11,10 +11,10 @@
  *   - add-with-AI drafting (async draft row becomes a member, or template fallback)
  *   - responsive rail overlay at narrow panel widths
  *
- * Writes dsh-kanban/docs/screenshots/kb13/final-verification.json and PNGs.
+ * Writes docs/screenshots/kb13/final-verification.json and PNGs.
  *
  * Usage (with Chrome on port 9333 and the app URL in $DSH_WEB_URL):
- *   node dsh-kanban/tools/kb13-probe.js
+ *   node tools/kb13-probe.js
  */
 import { writeFile, mkdir } from 'node:fs/promises'
 import { attach } from './cdp.mjs'
@@ -484,6 +484,6 @@ record('console/clean', 'no client errors captured during the run', relevantErro
   results.meta.failures = failures
   results.meta.checks = results.checks.length
   await writeFile(`${OUT}final-verification.json`, JSON.stringify(results, null, 2))
-  console.log(`\n${failures === 0 ? 'ALL KB-13 PROBE CHECKS PASSED' : `${failures} FAILURE(S)`} — evidence: dsh-kanban/docs/screenshots/kb13/final-verification.json`)
+  console.log(`\n${failures === 0 ? 'ALL KB-13 PROBE CHECKS PASSED' : `${failures} FAILURE(S)`} — evidence: docs/screenshots/kb13/final-verification.json`)
   process.exit(failures === 0 ? 0 : 1)
 }

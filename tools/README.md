@@ -25,9 +25,9 @@ HOME="$PWD/.chrome-home" TMPDIR="$PWD/.chrome-tmp" \
 Then, from the repository root:
 
 ```bash
-node dsh-kanban/tools/ui.mjs ensure
-node dsh-kanban/tools/ui.mjs shot .ui/home.png
-node dsh-kanban/tools/ui.mjs eval .ui/probe.js
+node tools/ui.mjs ensure
+node tools/ui.mjs shot .ui/home.png
+node tools/ui.mjs eval .ui/probe.js
 ```
 
 `ensure` opens the GUI, exchanges the signed cookie, waits for the shell, and installs

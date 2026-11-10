@@ -9,13 +9,25 @@ project selector, drag-and-drop columns, owner agents, a persisted team roster o
 with editable personas, 10 role playbooks, pause/resume controls, and a project scanner that can build
 the board from an existing project's docs, plans, AI conversations, and open MRs/PRs.
 
+The Host⇄Client wire contract lives in [docs/SHARED_BUILD_SPEC.md](docs/SHARED_BUILD_SPEC.md);
+versioned snapshot changes are recorded in [KANBAN_SPEC.md](KANBAN_SPEC.md).
+
 ## Install
 
-From the workspace that holds this directory:
+This project lives at `/Users/thefarag/Projects/AI/AI_Generated/HDS-Kanban` and is its own DSH
+Workspace. It is linked into the DSH profile (`~/.dsh/profiles/desktop`) as a local bundle, so the
+running Host resolves `@local/dsh-kanban` straight from this directory:
+
+```jsonc
+// ~/.dsh/profiles/desktop/package.json
+"dependencies": { "@local/dsh-kanban": "link:/Users/thefarag/Projects/AI/AI_Generated/HDS-Kanban" }
+```
+
+To point another machine or profile at a checkout:
 
 ```
 # in the DSH chat, ask the agent to install the bundle, or use the Plugins UI
-plugin_manager install_bundle target=/absolute/path/to/dsh-kanban
+plugin_manager install_bundle target=/absolute/path/to/HDS-Kanban
 ```
 
 Then refresh the Web GUI once. The bundle patch inserts one row:
@@ -269,13 +281,16 @@ blocked, so answering the questions returns the ticket exactly where it was.
 
 The package ships dependency-free Node test harnesses (no install needed):
 
+Run from this repository's root:
+
 ```
-node dsh-kanban/tests/host.test.mjs       # policy engine, HTTP routes, scanner, persistence
-node dsh-kanban/tests/scoping.test.mjs    # nested-workspace ownership, default project
-node dsh-kanban/tests/execution.test.mjs  # dispatch, scoped tool, block/answer, finish, cancel
-node dsh-kanban/tests/roles.test.mjs      # role catalog rigor, playbooks, personas, prompt composition
-node dsh-kanban/tests/team.test.mjs       # roster, migration, statuses, drafting, linkage, member actions
-node dsh-kanban/tests/client.test.mjs     # client module shape, locale coverage, slot registrations
+node --test tests/*.test.mjs              # everything
+node tests/host.test.mjs                  # policy engine, HTTP routes, scanner, persistence
+node tests/scoping.test.mjs               # nested-workspace ownership, default project
+node tests/execution.test.mjs             # dispatch, scoped tool, block/answer, finish, cancel
+node tests/roles.test.mjs                 # role catalog rigor, playbooks, personas, prompt composition
+node tests/team.test.mjs                  # roster, migration, statuses, drafting, linkage, member actions
+node tests/client.test.mjs                # client module shape, locale coverage, slot registrations
 ```
 
 They run against temporary directories and a fake Harness context/client runtime.
@@ -327,7 +342,7 @@ ticket drawer, drag & drop, team roster, per-agent pause/resume, board pause ban
 filters, search, project switching, scan drawer, open-session navigation, the blocked lane
 with question answering, and a full UI-dispatched agent execution through to its report.
 
-For the team panel specifically, run `node dsh-kanban/tools/kb13-probe.js`. It checks snapshot
+For the team panel specifically, run `node tools/kb13-probe.js`. It checks snapshot
 v2 (seeded roster, compact roles), the Members/Drafts/Other agents sections, the member editor
 and its composed-prompt preview, manual create/delete, the role-playbook viewer, Add-with-AI
 drafting (or the labelled template fallback), and the narrow-panel rail/drawer behaviour. It

@@ -182,9 +182,9 @@ editable roster of team members whose personas compose into dispatch prompts.
 
 ### Verification
 
-- `node dsh-kanban/tests/roles.test.mjs` — catalog rigor, distinct playbooks, seeded personas, prompt
+- `node tests/roles.test.mjs` — catalog rigor, distinct playbooks, seeded personas, prompt
   order, skill/host wiring.
-- `node dsh-kanban/tests/team.test.mjs` — v1 migration fixture, CRUD/validation/limits, statuses,
+- `node tests/team.test.mjs` — v1 migration fixture, CRUD/validation/limits, statuses,
   drafting + template fallback, linkage, RBAC, system prompt.
-- `node dsh-kanban/tools/kb13-probe.js` — headless Chrome over the real GUI; evidence in
-  `dsh-kanban/docs/screenshots/kb13/` (`final-verification.json` + PNGs).
+- `node tools/kb13-probe.js` — headless Chrome over the real GUI; evidence in
+  `docs/screenshots/kb13/` (`final-verification.json` + PNGs).

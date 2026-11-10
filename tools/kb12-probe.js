@@ -4,11 +4,11 @@
  *
  * Drives the real DSH Web GUI in headless Chrome (see tools/README.md) and asserts
  * AC1–AC7 from the ticket, then writes:
- *   dsh-kanban/docs/screenshots/kb12/final-verification.json
- *   dsh-kanban/docs/screenshots/kb12/after-*.png
+ *   docs/screenshots/kb12/final-verification.json
+ *   docs/screenshots/kb12/after-*.png
  *
  * Usage (from the repository root, with Chrome on port 9333):
- *   node dsh-kanban/tools/kb12-probe.js
+ *   node tools/kb12-probe.js
  */
 import { writeFile, mkdir } from 'node:fs/promises'
 import { attach } from './cdp.mjs'
@@ -126,7 +126,7 @@ async function ensureDrawerClosed() {
 
 async function shoot(name, extra = {}) {
   await app.screenshot(OUT + name)
-  results.screenshots.push({ file: `dsh-kanban/docs/screenshots/kb12/${name}`, ...extra })
+  results.screenshots.push({ file: `docs/screenshots/kb12/${name}`, ...extra })
   return name
 }
 
@@ -138,7 +138,7 @@ async function shootClip(name, clip) {
     clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 },
   })
   await writeFile(OUT + name, Buffer.from(data, 'base64'))
-  results.screenshots.push({ file: `dsh-kanban/docs/screenshots/kb12/${name}`, clip })
+  results.screenshots.push({ file: `docs/screenshots/kb12/${name}`, clip })
 }
 
 // ---------------------------------------------------------------------------
@@ -815,5 +815,5 @@ record('AC8', 'no Kanban console errors or unhandled exceptions during the probe
 
 results.summary = { checks: results.checks.length, failures, pass: failures === 0 }
 await writeFile(OUT + 'final-verification.json', JSON.stringify(results, null, 1))
-console.log(`\n${failures === 0 ? 'ALL KB-12 CHECKS PASSED' : `${failures} FAILURE(S)`} — evidence: dsh-kanban/docs/screenshots/kb12/final-verification.json`)
+console.log(`\n${failures === 0 ? 'ALL KB-12 CHECKS PASSED' : `${failures} FAILURE(S)`} — evidence: docs/screenshots/kb12/final-verification.json`)
 process.exit(failures === 0 ? 0 : 1)
