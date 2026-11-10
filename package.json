@@ -1,0 +1,42 @@
+{
+  "name": "@local/dsh-kanban",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Project Kanban board for DeepSeek Harness: drag-and-drop board, role playbooks, persisted team roster with editable personas, project scanner, and a strict Kanban policy every agent follows.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./roles": "./roles.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "roles.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "tests/*.mjs",
+    "docs/screenshots/*.png",
+    "tools/*.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

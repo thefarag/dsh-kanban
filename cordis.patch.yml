@@ -1,0 +1,10 @@
+# Kanban board bundle: one Host row owns the board store, HTTP routes, the
+# `kanban` agent tool, and the Kanban policy system-prompt section. The Web
+# client half is discovered from the package's `dsh.client` declaration.
+- insert:
+    - id: kanban
+      name: '@local/dsh-kanban'
+      config:
+        wipInProgress: 3
+        wipReview: 5
+        scanMaxFiles: 160

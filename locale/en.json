@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Kanban Board",
+    "description": "A project-scoped Kanban board with drag-and-drop workflow, rigorous per-role playbooks, a persisted team roster with editable personas and live status, project scanning, and a strict Kanban policy every agent in the project follows."
+  }
+}

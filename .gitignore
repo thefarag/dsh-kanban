@@ -1,0 +1,16 @@
+# dependencies
+node_modules/
+
+# OS / editor noise
+.DS_Store
+*.log
+
+# local browser/UI test harness state
+.cdp-profile/
+.chrome-home/
+.chrome-tmp/
+.ui/
+
+# env / secrets
+.env
+.env.*
