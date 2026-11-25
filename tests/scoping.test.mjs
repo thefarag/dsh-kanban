@@ -105,7 +105,7 @@ async function state(workspaceId) {
 
 const parentState = await state('workspace-parent');
 check('parent exists', parentState.project.id === 'workspace-parent');
-check('parent team excludes child session', parentState.team.every((row) => row.sessionId !== 'session-child'), JSON.stringify(parentState.team.map((row) => row.sessionId)));
+check('parent sessions exclude child session', parentState.sessions.every((row) => row.sessionId !== 'session-child'), JSON.stringify(parentState.sessions.map((row) => row.sessionId)));
 check(
   'parent project counts exclude child session',
   parentState.projects.find((project) => project.id === 'workspace-parent').sessionCount === 1,
@@ -118,8 +118,9 @@ check(
 );
 
 const childState = await state('workspace-child');
-check('child team includes child session', childState.team.some((row) => row.sessionId === 'session-child'));
-check('child team excludes parent session', childState.team.every((row) => row.sessionId !== 'session-parent'));
+check('child sessions include child session', childState.sessions.some((row) => row.sessionId === 'session-child'), JSON.stringify(childState.sessions.map((row) => row.sessionId)));
+check('team rows are attached roster agents only', childState.team.every((row) => typeof row.memberId === 'string'), JSON.stringify(childState.team));
+check('child sessions exclude parent session', childState.sessions.every((row) => row.sessionId !== 'session-parent'));
 
 const defaultState = await state(undefined);
 check('default project is newest session owner', defaultState.project.id === 'workspace-child', defaultState.project.id);

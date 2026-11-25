@@ -185,7 +185,9 @@ const ticketFrom = async (id) => (await state()).board.tickets.find((ticket) => 
 // --- dispatch ---------------------------------------------------------------
 const accessState = await state();
 check('access catalog exposed', accessState.accessModes?.options?.length === 3, JSON.stringify(accessState.accessModes?.options?.map((option) => option.value)));
-check('access suggestion per lane', accessState.accessModes?.suggestions?.ready === 'workspace-write' && accessState.accessModes?.suggestions?.review === 'read-only', JSON.stringify(accessState.accessModes?.suggestions));
+// KB-73 access decision: Review runs the test-capable preset (workspace-write)
+// because a read-only sandbox cannot execute `node --test` (EPERM mkdtemp in TMPDIR).
+check('access suggestion per lane', accessState.accessModes?.suggestions?.ready === 'workspace-write' && accessState.accessModes?.suggestions?.review === 'workspace-write', JSON.stringify(accessState.accessModes?.suggestions));
 
 let res = await action('createTicket', {
   title: 'Execution test ticket',
@@ -236,7 +238,7 @@ check('finish stores report', finished.execution?.report === 'Execution test com
 res = await action('runTicket', { ticketId: 'KB-1' });
 const handoffRun = res.json.value.ticket;
 check('handoff start uses reviewer', handoffRun.execution?.role === 'reviewer', handoffRun.execution?.role);
-check('handoff carries access mode', handoffRun.execution?.accessMode === 'read-only', handoffRun.execution?.accessMode);
+check('handoff carries access mode', handoffRun.execution?.accessMode === 'workspace-write', handoffRun.execution?.accessMode);
 check('handoff clears assignment', handoffRun.assignment === null, JSON.stringify(handoffRun.assignment));
 const handoffPrompt = prompts[prompts.length - 1];
 check('handoff prompt includes report', handoffPrompt.text.includes('Previous agent report') && handoffPrompt.text.includes('Execution test complete.'), handoffPrompt.text.slice(-160));

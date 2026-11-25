@@ -6,9 +6,9 @@ node_modules/
 *.log
 
 # local browser/UI test harness state
-.cdp-profile/
-.chrome-home/
-.chrome-tmp/
+.cdp-*/
+.chrome-*/
+.tmp-*/
 .ui/
 
 # env / secrets

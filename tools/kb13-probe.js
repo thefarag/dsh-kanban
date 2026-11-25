@@ -4,7 +4,7 @@
  * Drives the real DSH Web GUI in headless Chrome (see tools/README.md) and
  * asserts the KB-13 acceptance contract end to end:
  *   - snapshot v2 with a seeded 10-member roster + compact role catalog
- *   - team rail roster, live statuses, other-agents section
+ *   - team rail fixed roster with attached-agent statuses (no other-agents section)
  *   - member editor with composed-prompt preview (memberPrompt)
  *   - member CRUD through the UI (create + delete restores the roster)
  *   - role playbook viewer (roleDetail)
@@ -223,7 +223,7 @@ record('snapshot/rolesCompact', 'roles are compact (no full playbook)', roleRows
 record('snapshot/bugFixer', 'bug-fixer role is present', roleRows.some((role) => role.id === 'bug-fixer'))
 const bugRow = roleRows.find((role) => role.id === 'bug-fixer')
 record('snapshot/bugFixerSteps', 'bug-fixer advertises 11 playbook steps', bugRow && bugRow.stepCount === 11, bugRow && bugRow.stepCount)
-record('snapshot/rosterShape', 'roster rows carry status/persona/ticket fields', (snap.roster || []).every((member) => ['paused', 'working', 'running', 'idle', 'offline'].includes(member.status) && typeof member.persona === 'string' && member.persona.length > 500 && typeof member.roleName === 'string'))
+record('snapshot/rosterShape', 'roster rows carry status/persona/ticket fields', (snap.roster || []).every((member) => ['paused', 'running', 'idle', 'offline'].includes(member.status) && typeof member.persona === 'string' && member.persona.length > 500 && typeof member.roleName === 'string'))
 const seededIds = new Set((snap.roster || []).map((member) => member.id))
 seededMemberIds = seededIds
 record('snapshot/deterministicIds', 'seeded ids are member-<roleId>', seededIds.size === 10 && [...seededIds].every((id) => id.startsWith('member-')))
@@ -240,7 +240,7 @@ record('api/validation', 'duplicate roster name is rejected with member/name-tak
 
 try {
 // ---------------------------------------------------------------------------
-// 2. Team rail: roster, live statuses, other agents
+// 2. Team rail: fixed roster and attached-agent statuses
 // ---------------------------------------------------------------------------
 
 await clickIn('.kb-header', 'Team')
@@ -248,7 +248,7 @@ await app.waitFor(`!!document.querySelector('.kb-rail')`, 8000, 'team rail')
 record('ui/railOpen', 'team rail opens', true)
 const railText = await app.evaluate(`document.querySelector('.kb-rail') ? document.querySelector('.kb-rail').innerText : ''`)
 record('ui/railRosterSection', 'rail renders the Members section', /Members/i.test(railText))
-record('ui/railOtherAgents', 'rail renders the Other agents section', /Other agents/i.test(railText))
+record('ui/railNoOtherAgents', 'rail has no Other agents section', !/Other agents/i.test(railText))
 record('ui/railRolePlaybooks', 'rail exposes role playbooks', /Role playbooks/i.test(railText))
 record('ui/railDraftButton', 'rail exposes Add with AI', /Add with AI/i.test(railText))
 record('ui/railAddMember', 'rail exposes Add member', /Add member/i.test(railText))
@@ -258,6 +258,7 @@ const visibleStatuses = await app.evaluate(
   `[...document.querySelectorAll('.kb-rosterRow')].map((row) => (row.querySelector('.kb-teamStatus,.kb-rosterStatus') || {}).innerText || '').filter(Boolean)`,
 )
 record('ui/statuses', 'each roster row renders a text status', visibleStatuses.length >= 10 && visibleStatuses.every((label) => label.trim().length > 0), visibleStatuses.slice(0, 10))
+record('ui/statusesTruthful', 'no roster row claims the retired Working status', visibleStatuses.every((label) => !/^working$/i.test(label.trim())), visibleStatuses.slice(0, 10))
 const railOverflow = await app.evaluate(`(() => { const rail = document.querySelector('.kb-rail'); return rail ? rail.scrollWidth - rail.clientWidth : -1; })()`)
 record('ui/railNoOverflow', 'team rail never overflows horizontally', railOverflow <= 1, railOverflow)
 await shot('team-rail-light')

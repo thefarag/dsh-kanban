@@ -148,7 +148,10 @@ function makeHarness(dir, { graceMs = 2000 } = {}) {
   services.permissionPresets = ctx.permissionPresets;
   services.agentPresets = ctx.agentPresets;
 
-  apply(ctx, { stateDir: dir, thoughtGraceMs: graceMs });
+  // KB-6 adds a per-workspace intake budget (5/min, 20/hour). This suite
+  // deliberately captures many thoughts back-to-back, so it opts out with the
+  // host knob; tests/thought-hardening.test.mjs exercises the shipped defaults.
+  apply(ctx, { stateDir: dir, thoughtGraceMs: graceMs, thoughtRateLimits: { perMinute: 1000, perHour: 10000 } });
 
   async function post(path, body) {
     const route = routes.get(path);
@@ -227,10 +230,10 @@ const app = makeHarness(stateDir);
 let state = await app.state();
 check('snapshot ok', state.ok === true && state.value !== undefined);
 let snap = state.value;
-check('snapshot version 2 (no schema bump)', snap.version === 2, String(snap.version));
+check('snapshot version 3 (EPIC model schema)', snap.version === 3, String(snap.version));
 check('thoughts is an empty additive array', Array.isArray(snap.thoughts) && snap.thoughts.length === 0, JSON.stringify(snap.thoughts));
 check('board has no thoughts key', snap.board && !('thoughts' in snap.board), Object.keys(snap.board ?? {}).filter((key) => key === 'thoughts').join(','));
-check('board version still 2', snap.board.version === 2, String(snap.board.version));
+check('board version is 3', snap.board.version === 3, String(snap.board.version));
 
 // --- 2. validation ---------------------------------------------------------
 await expectError('non-string text is bad-request', () => app.action('submitThought', { text: 42 }), 400, 'bad-request');
@@ -265,14 +268,19 @@ check('seeded product manager exists', Boolean(seedPm) && seedPm.name.length > 2
 const firstPrompt = app.prompts.find((entry) => entry.sessionId === first.sessionId)?.text ?? '';
 check('prompt carries the thought verbatim', firstPrompt.includes(firstText.trim()), firstPrompt.slice(0, 80));
 check('prompt carries the PM role playbook + persona', firstPrompt.includes(seedPm?.persona?.slice(0, 60) ?? 'missing-persona'), seedPm?.name);
-check('prompt carries all six rules', [
+// KB-4 deliberately replaces the old "Do not create an EPIC" rule with the
+// EPIC-vs-tickets decision rule; the read-only/Backlog wording is unchanged.
+check('prompt carries the intake and KB-4 decomposition rules', [
   'Read the board first',
   '1–20 independently shippable tickets',
   'numbered, testable acceptance criteria',
   'Backlog only',
-  'Do not create an EPIC',
-  'summary of created ticket ids',
+  'Create an EPIC only when the thought needs two or more related tickets, a new feature, or a new project.',
+  'A single small thought yields tickets only, with no EPIC.',
+  'parentId',
+  'Finish with a short summary',
 ].every((rule) => firstPrompt.includes(rule)), firstPrompt.slice(0, 120));
+check('prompt no longer forbids EPICs (KB-4 rule replacement)', !firstPrompt.includes('Do not create an EPIC'), firstPrompt.slice(0, 120));
 check('prompt says the session is read-only and tool-scoped', /read-only/i.test(firstPrompt) && /thought-read-only/.test(firstPrompt));
 
 snap = (await app.state()).value;
@@ -356,11 +364,24 @@ app.observe(res.json.value.thought.sessionId, true);
 await expectError('fourth working thought is thought/limit', () => app.action('submitThought', { text: 'This should not start' }), 409, 'thought/limit');
 res = await app.action('pauseBoard', {});
 check('board paused', res.status === 200 && res.json.value.board.paused === true, String(res.status));
+const pausedCallsBefore = app.createCalls.length;
 res = await app.action('submitThought', { text: 'Captured while paused?' });
-check('paused capture is 423 board/paused', res.status === 423 && res.json.error.code === 'board/paused', `${res.status} ${res.json?.error?.code}`);
-check('paused message tells the user to resume', /resume/i.test(res.json?.error?.message ?? ''), res.json?.error?.message);
+check(
+  'paused capture is accepted as queued',
+  res.status === 200 && res.json.ok === true && res.json.value.thought.status === 'queued',
+  `${res.status} ${res.json?.value?.thought?.status} ${res.json?.error?.code}`,
+);
+const queuedThought = res.json.value.thought;
+check(
+  'queued thought has no session and no tickets',
+  queuedThought.sessionId === null && Array.isArray(queuedThought.ticketIds) && queuedThought.ticketIds.length === 0,
+  JSON.stringify({ sessionId: queuedThought.sessionId, tickets: queuedThought.ticketIds }),
+);
+check('paused capture dispatches nothing', app.createCalls.length === pausedCallsBefore, String(app.createCalls.length - pausedCallsBefore));
 res = await app.action('resumeBoard', {});
 check('board resumed', res.status === 200 && res.json.value.board.paused === false, String(res.status));
+const queuedAfterResume = (await app.state()).value.thoughts.find((thought) => thought.id === queuedThought.id)?.status;
+check('queued thought stays queued while 3 thoughts are working', queuedAfterResume === 'queued', queuedAfterResume);
 
 // --- 7. completion: working -> done, exactly once, 0 tickets is valid ------
 await sleep(1600);
@@ -422,11 +443,13 @@ check('4000 chars is accepted', res.status === 200 && res.json.value.thought.sta
 const thoughtFile = join(stateDir, 'thoughts', 'workspace-1.json');
 const thoughtFileRaw = JSON.parse(await readFile(thoughtFile, 'utf8'));
 check('thought store file versioned', thoughtFileRaw.version === 1, String(thoughtFileRaw.version));
-check('thought store file holds every record', thoughtFileRaw.thoughts.length === 7, String(thoughtFileRaw.thoughts.length));
-check('thought store allocates TH-n from a persisted counter', thoughtFileRaw.nextNumber === 8, String(thoughtFileRaw.nextNumber));
+// KB-5: the paused capture above is now persisted as a queued row, so the file
+// holds 8 records (TH-1 … TH-8) and the persisted counter has advanced to 9.
+check('thought store file holds every record', thoughtFileRaw.thoughts.length === 8, String(thoughtFileRaw.thoughts.length));
+check('thought store allocates TH-n from a persisted counter', thoughtFileRaw.nextNumber === 9, String(thoughtFileRaw.nextNumber));
 const boardFileRaw = JSON.parse(await readFile(join(stateDir, 'workspace-1.json'), 'utf8'));
 check('board file has no thoughts key', !('thoughts' in boardFileRaw), Object.keys(boardFileRaw).join(','));
-check('board file version is still 2', boardFileRaw.version === 2, String(boardFileRaw.version));
+check('board file version is 3', boardFileRaw.version === 3, String(boardFileRaw.version));
 check('no atomic temp files left behind', (await readdir(join(stateDir, 'thoughts'))).every((name) => !name.includes('.tmp-')), JSON.stringify(await readdir(join(stateDir, 'thoughts'))));
 
 const restarted = makeHarness(stateDir);
@@ -436,7 +459,7 @@ check('restart preserves id/text/status', restartedFirst?.id === 'TH-1' && resta
 check('restart preserves ticket linkage', JSON.stringify(restartedFirst?.ticketIds) === JSON.stringify(['KB-1', 'KB-2']), JSON.stringify(restartedFirst?.ticketIds));
 const restartedTicket = restartedState.board.tickets.find((ticket) => ticket.id === 'KB-1');
 check('ticket.thoughtId survives restart', restartedTicket?.thoughtId === 'TH-1' && restartedTicket?.column === 'backlog', JSON.stringify({ thoughtId: restartedTicket?.thoughtId, column: restartedTicket?.column }));
-check('restart still reports a v2 board', restartedState.version === 2 && restartedState.board.version === 2);
+check('restart still reports a v3 board', restartedState.version === 3 && restartedState.board.version === 3);
 
 // --- 12. tolerant reads: missing and corrupt thought files ----------------
 const corruptDir = await mkdtemp(join(tmpdir(), 'kanban-thoughts-corrupt-'));
@@ -445,7 +468,7 @@ await writeFile(join(corruptDir, 'thoughts', 'workspace-1.json'), '{ not json at
 const corrupt = makeHarness(corruptDir);
 const corruptState = (await corrupt.state()).value;
 check('corrupt thoughts file degrades to []', Array.isArray(corruptState.thoughts) && corruptState.thoughts.length === 0, JSON.stringify(corruptState.thoughts));
-check('board still loads with a corrupt thoughts file', Boolean(corruptState.board) && corruptState.board.version === 2);
+check('board still loads with a corrupt thoughts file', Boolean(corruptState.board) && corruptState.board.version === 3);
 check('corrupt file was set aside', (await readdir(join(corruptDir, 'thoughts'))).some((name) => name.includes('.corrupt-')), JSON.stringify(await readdir(join(corruptDir, 'thoughts'))));
 const missingDir = await mkdtemp(join(tmpdir(), 'kanban-thoughts-missing-'));
 const missing = makeHarness(missingDir);
@@ -473,6 +496,29 @@ const capped = makeHarness(capDir);
 const cappedThoughts = (await capped.state()).value.thoughts;
 check('snapshot caps thoughts at 50', cappedThoughts.length === 50, String(cappedThoughts.length));
 check('capped snapshot is newest first', cappedThoughts[0]?.id === 'TH-60' && cappedThoughts[49]?.id === 'TH-11', `${cappedThoughts[0]?.id} … ${cappedThoughts[49]?.id}`);
+
+// --- 14. KB-6 additive: normalized duplicates + persisted intake audit ------
+{
+  const kb6Dir = await mkdtemp(join(tmpdir(), 'kanban-thoughts-kb6-'));
+  const kb6 = makeHarness(kb6Dir);
+  const firstRes = await kb6.action('submitThought', { text: '  Add   a   KB-6   audit  ' });
+  check('KB-6 first thought accepted as TH-1', firstRes.status === 200 && firstRes.json.value.thought.id === 'TH-1', `${firstRes.status} ${firstRes.json?.error?.code}`);
+  const firstThought = firstRes.json.value.thought;
+  check('KB-6 stored text stays verbatim after trimming', firstThought.text === 'Add   a   KB-6   audit', JSON.stringify(firstThought.text));
+  check('KB-6 intake audit records submitted then dispatched', JSON.stringify(firstThought.intakeAudit.map((entry) => entry.type)) === JSON.stringify(['submitted', 'dispatched']), JSON.stringify(firstThought.intakeAudit));
+  check('KB-6 dispatched audit carries the session id', firstThought.intakeAudit[1].sessionId === firstThought.sessionId);
+  const createsBefore = kb6.createCalls.length;
+  const dupRes = await kb6.action('submitThought', { text: 'add a kb-6 AUDIT' });
+  check('KB-6 normalized duplicate is 409 thought/duplicate', dupRes.status === 409 && dupRes.json?.error?.code === 'thought/duplicate', `${dupRes.status} ${dupRes.json?.error?.code}`);
+  check('KB-6 duplicate message names the existing thought', /TH-1/.test(dupRes.json?.error?.message ?? ''), dupRes.json?.error?.message);
+  check('KB-6 duplicate dispatches nothing', kb6.createCalls.length === createsBefore);
+  const kb6Snap = (await kb6.state()).value;
+  check('KB-6 snapshot rows expose intakeAudit additively', Array.isArray(kb6Snap.thoughts[0].intakeAudit) && kb6Snap.thoughts[0].intakeAudit.length === 2, JSON.stringify(kb6Snap.thoughts[0].intakeAudit));
+  const kb6Store = JSON.parse(await readFile(join(kb6Dir, 'thoughts', 'workspace-1.json'), 'utf8'));
+  check('KB-6 intake audit is persisted in the thought store', JSON.stringify(kb6Store.thoughts[0].intakeAudit.map((entry) => entry.type)) === JSON.stringify(['submitted', 'dispatched']));
+  check('KB-6 adds no board schema change', kb6Snap.board.version === 3 && !('thoughts' in kb6Snap.board));
+  await rm(kb6Dir, { recursive: true, force: true });
+}
 
 console.log('\n' + (failures.length === 0 ? 'ALL THOUGHT CHECKS PASSED' : `${failures.length} FAILURE(S):\n- ${failures.join('\n- ')}`));
 await rm(root, { recursive: true, force: true });

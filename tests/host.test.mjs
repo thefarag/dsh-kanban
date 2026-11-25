@@ -266,14 +266,20 @@ check('state route', res.status === 200 && res.json.ok, String(res.status));
 const snap = res.json.value;
 check('state projects', snap.projects.length === 1 && snap.projects[0].title === 'Demo');
 check('state board tickets', snap.board.tickets.length >= 7, String(snap.board.tickets.length));
-check('state team', Array.isArray(snap.team) && snap.team.length === 1, JSON.stringify(snap.team?.map((m) => m.role)));
+check('state team lists only attached roster agents', Array.isArray(snap.team) && snap.team.every((row) => typeof row.memberId === 'string'), JSON.stringify(snap.team?.map((m) => m.memberId ?? m.sessionId)));
 check('state rules', snap.rules.roles.length === 10 && snap.rules.columns.length === 5, String(snap.rules.roles.length));
-check('state snapshot version', snap.version === 2, String(snap.version));
+check('state snapshot version', snap.version === 3, String(snap.version));
 check('state roster seeded', Array.isArray(snap.roster) && snap.roster.length === 10, String(snap.roster?.length));
 check('state drafts empty', Array.isArray(snap.drafts) && snap.drafts.length === 0);
 check('state rules compact roles', snap.rules.roles.every((role) => typeof role.stepCount === 'number' && Array.isArray(role.definitionOfDone) && !('playbook' in role)));
 check('state includes bug-fixer', snap.rules.roles.some((role) => role.id === 'bug-fixer'));
 check('prompt section has persona line', typeof promptSection?.text === 'string' && promptSection.text.includes('persona'));
+// KB-68 additive schema: the board version is unchanged and the autopilot read
+// model rides alongside the existing snapshot shape.
+check('state board version is still 3', snap.board.version === 3 && snap.version === 3, `${snap.board.version}/${snap.version}`);
+check('state board autopilot envelope is synthesized', snap.board.autopilot?.version === 1 && snap.board.pulses.length === 0, JSON.stringify(snap.board.autopilot?.version));
+check('state autopilot read model uses the ticket defaults', snap.autopilot?.config?.enabled === false && snap.autopilot.config.budget.hour === 20 && snap.autopilot.config.budget.day === 60, JSON.stringify(snap.autopilot?.config?.budget));
+check('state tickets expose an empty reviews list', snap.board.tickets.every((ticket) => Array.isArray(ticket.reviews) && ticket.reviews.length === 0));
 
 // Board persisted to disk.
 const persisted = JSON.parse(await readFile(join(stateDir, 'workspace-1.json'), 'utf8'));

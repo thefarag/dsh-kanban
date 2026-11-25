@@ -37,7 +37,7 @@ window.__ModuleLoader__.load({
 		const STORAGE_KEY = 'dsh.kanban.workspace'
 		const POLL_MS = 2500
 		const COLUMNS = ['backlog', 'ready', 'in_progress', 'review', 'done']
-		const TYPES = ['story', 'task', 'bug', 'spike']
+		const TYPES = ['story', 'task', 'bug', 'spike', 'epic']
 		const PRIORITIES = ['low', 'medium', 'high', 'critical']
 		const ROLE_IDS = [
 			'product-manager',
@@ -51,8 +51,8 @@ window.__ModuleLoader__.load({
 			'tech-lead',
 			'bug-fixer',
 		]
-		// MemberRow.status values (KB-13) plus the legacy AgentRow statuses.
-		const MEMBER_STATUSES = ['paused', 'working', 'running', 'idle', 'offline']
+		// MemberRow.status values are derived by the host from the attached agent.
+		const MEMBER_STATUSES = ['paused', 'running', 'idle', 'offline']
 		const AGENT_STATUSES = ['running', 'idle', 'paused', 'provisioning', 'failed']
 		const DRAFT_LIMIT = 3
 		const UNASSIGNED = '__unassigned__'
@@ -131,6 +131,1092 @@ window.__ModuleLoader__.load({
 			return ticket.id + (title ? ' · ' + title : '')
 		}
 
+		// ------------------------------------------------------------------
+		// Autopilot controls (KB-76) — pure state machine and view helpers
+		// ------------------------------------------------------------------
+		//
+		// Host contract (KB-68/KB-69/KB-70): `autopilot {op:'status'|'configure'|
+		// 'plan'|'pulseNow'}` through `/kanban/action`. The snapshot carries the
+		// derived read model `snapshot.autopilot` (config, nextTickAt, lastPulse,
+		// budgetRemaining) plus the persisted `board.autopilot` / `board.pulses`.
+		// The dry run returns `{generatedAt, decisions[], skips[]}` without writing
+		// or starting anything; `pulseNow` returns `{pulse}` and can answer
+		// `409 autopilot/pulsing`. Everything below is dependency-free so the UI
+		// state machine can be tested without a DOM (tests/autopilot-ui.test.mjs).
+
+		const AUTOPILOT_CONFIRM_KEY = 'dsh.kanban.autopilot.phase1-confirmed'
+		const AUTOPILOT_COMMIT_MS = 220
+		const AUTOPILOT_LANES = ['refine', 'implement', 'review']
+		const AUTOPILOT_CADENCE_MINUTES = [5, 10, 15, 30, 60]
+		const AUTOPILOT_DEPTH_OPTIONS = (() => {
+			const list = []
+			for (let value = 0; value <= 20; value += 1) list.push(value)
+			return list
+		})()
+		const AUTOPILOT_LANE_CAP_OPTIONS = [0, 1, 2, 3]
+		// Closed reason-code vocabulary the host planner emits. Unknown codes from a
+		// newer host still render (a localized fallback carrying the raw code).
+		const AUTOPILOT_REASON_CODES = [
+			'admitted',
+			'disabled',
+			'board-paused',
+			'epic',
+			'blocked',
+			'active-execution',
+			'lane-cap',
+			'wip-limit',
+			'ready-depth',
+			'no-member',
+			'member-busy',
+			'member-paused',
+			'stale-execution',
+			'postcondition-failed',
+			'budget-exhausted',
+			'loop-guard',
+			'pulse-cap',
+			'no-work',
+		]
+
+		/** `true` once the phase-1 one-time confirmation was dismissed in this browser. */
+		function readAutopilotConfirmSeen() {
+			try {
+				return window.localStorage.getItem(AUTOPILOT_CONFIRM_KEY) === '1'
+			} catch (error) {
+				return false
+			}
+		}
+
+		function markAutopilotConfirmSeen() {
+			try {
+				window.localStorage.setItem(AUTOPILOT_CONFIRM_KEY, '1')
+			} catch (error) {
+				// storage is best-effort; the confirmation reappears next session
+			}
+		}
+
+		/**
+		 * Pause cause for the header status: the board pause wins, otherwise a
+		 * roster whose every member is paused. `null` when autopilot is effective.
+		 */
+		function autopilotPauseCause(snapshot) {
+			const snap = snapshot && typeof snapshot === 'object' ? snapshot : null
+			const board = snap && snap.board && typeof snap.board === 'object' ? snap.board : null
+			if (board && board.paused === true) return 'board'
+			const roster = snap && Array.isArray(snap.roster) ? snap.roster.filter((member) => member && typeof member === 'object') : []
+			if (roster.length > 0 && roster.every((member) => member.paused === true)) return 'member'
+			return null
+		}
+
+		/** Normalize the public config view (status) or the persisted envelope to one shape. */
+		function normalizeAutopilotConfig(raw) {
+			if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+			const laneCaps = raw.laneCaps && typeof raw.laneCaps === 'object' ? raw.laneCaps : {}
+			const rawBudget = raw.budget && typeof raw.budget === 'object' ? raw.budget : {}
+			const hourLimit =
+				typeof rawBudget.hour === 'number'
+					? rawBudget.hour
+					: safeNumber(rawBudget.hour && rawBudget.hour.limit, 20)
+			const dayLimit =
+				typeof rawBudget.day === 'number' ? rawBudget.day : safeNumber(rawBudget.day && rawBudget.day.limit, 60)
+			return {
+				enabled: raw.enabled === true,
+				cadenceMs: safeNumber(raw.cadenceMs, 300000),
+				maxReadyDepth: safeNumber(raw.maxReadyDepth, 3),
+				laneCaps: {
+					refine: safeNumber(laneCaps.refine, 1),
+					implement: safeNumber(laneCaps.implement, 1),
+					review: safeNumber(laneCaps.review, 1),
+				},
+				maxDispatchesPerPulse: safeNumber(raw.maxDispatchesPerPulse, 1),
+				budget: { hour: hourLimit, day: dayLimit },
+				backoffMs: safeNumber(raw.backoffMs, 300000),
+				staleMs: safeNumber(raw.staleMs, 600000),
+			}
+		}
+
+		/** Dispatch-budget read-out: derived remaining first, persisted counters as fallback. */
+		function autopilotBudgetView(runtime, envelope) {
+			const remaining =
+				runtime && runtime.budgetRemaining && typeof runtime.budgetRemaining === 'object' ? runtime.budgetRemaining : null
+			if (remaining && remaining.hour && remaining.day) {
+				return {
+					hour: {
+						used: safeNumber(remaining.hour.used, 0),
+						limit: safeNumber(remaining.hour.limit, 0),
+						remaining: safeNumber(remaining.hour.remaining, 0),
+					},
+					day: {
+						used: safeNumber(remaining.day.used, 0),
+						limit: safeNumber(remaining.day.limit, 0),
+						remaining: safeNumber(remaining.day.remaining, 0),
+					},
+				}
+			}
+			const budget = envelope && envelope.budget && typeof envelope.budget === 'object' ? envelope.budget : null
+			if (!budget) return null
+			const unit = (window) => {
+				// A config view stores the limit as a number; the persisted envelope
+				// stores a `{limit, used, windowStart}` object. Accept both.
+				if (typeof window === 'number') {
+					const limit = safeNumber(window, 0)
+					return { used: 0, limit, remaining: limit }
+				}
+				const value = window && typeof window === 'object' ? window : {}
+				const limit = safeNumber(value.limit, 0)
+				const used = Math.min(limit, Math.max(0, safeNumber(value.used, 0)))
+				return { used, limit, remaining: Math.max(0, limit - used) }
+			}
+			return { hour: unit(budget.hour), day: unit(budget.day) }
+		}
+
+		/** Read-model view of autopilot from a snapshot; every field is optional. */
+		function autopilotViewFromSnapshot(snapshot) {
+			const snap = snapshot && typeof snapshot === 'object' ? snapshot : null
+			const runtime = snap && snap.autopilot && typeof snap.autopilot === 'object' ? snap.autopilot : null
+			const board = snap && snap.board && typeof snap.board === 'object' ? snap.board : null
+			const envelope = board && board.autopilot && typeof board.autopilot === 'object' ? board.autopilot : null
+			const rawConfig = runtime && runtime.config && typeof runtime.config === 'object' ? runtime.config : envelope
+			const config = normalizeAutopilotConfig(rawConfig)
+			const pauseCause = autopilotPauseCause(snap)
+			const roster = snap && Array.isArray(snap.roster) ? snap.roster.filter((member) => member && typeof member === 'object') : []
+			const previousPulse = board && Array.isArray(board.pulses) && board.pulses[0]
+			// KB-77 observability fields, additive and optional for older hosts:
+			// the persisted pulse ring, the host clock the poll was served at (the
+			// countdown projects forward from it), live lane occupancy derived from
+			// ticket execution rows, and the persisted fairness timestamp per member.
+			const pulses = board && Array.isArray(board.pulses) ? board.pulses.filter((pulse) => pulse && typeof pulse === 'object') : []
+			const boardMembers = board && board.team && Array.isArray(board.team.members) ? board.team.members : []
+			const memberActivatedAt = {}
+			boardMembers.forEach((member) => {
+				if (member && typeof member.id === 'string' && Number.isFinite(member.lastActivatedAt)) {
+					memberActivatedAt[member.id] = member.lastActivatedAt
+				}
+			})
+			return {
+				available: Boolean(config),
+				config,
+				pauseCause,
+				paused: pauseCause !== null,
+				membersPaused: roster.some((member) => member.paused === true),
+				budget: autopilotBudgetView(runtime, envelope),
+				nextTickAt: runtime && Number.isFinite(runtime.nextTickAt) ? runtime.nextTickAt : null,
+				lastPulse:
+					runtime && runtime.lastPulse && typeof runtime.lastPulse === 'object'
+						? runtime.lastPulse
+						: previousPulse || null,
+				hostNow: snap && Number.isFinite(snap.now) ? snap.now : null,
+				pulses,
+				laneOccupancy: autopilotLaneOccupancy(board && board.tickets),
+				memberActivatedAt,
+			}
+		}
+
+		function initialAutopilotUi(workspaceId) {
+			return {
+				workspaceId: typeof workspaceId === 'string' && workspaceId ? workspaceId : null,
+				available: false,
+				config: null,
+				values: null,
+				confirmed: null,
+				pauseCause: null,
+				paused: false,
+				membersPaused: false,
+				budget: null,
+				nextTickAt: null,
+				lastPulse: null,
+				phase: 'idle',
+				busy: null,
+				dirty: false,
+				seq: 0,
+				error: null,
+				preview: null,
+				previewAt: 0,
+				pulse: null,
+				phase1: false,
+			}
+		}
+
+		function normalizeAutopilotError(error) {
+			const value = error && typeof error === 'object' ? error : {}
+			return {
+				code: typeof value.code === 'string' && value.code ? value.code : 'unknown',
+				message: typeof value.message === 'string' ? value.message : '',
+			}
+		}
+
+		/** Human explanation for a host autopilot error code; raw host message as fallback. */
+		function autopilotErrorText(error, t) {
+			if (!error) return ''
+			if (error.code === 'autopilot/pulsing') return t('autopilot.errorPulsing')
+			if (error.code === 'autopilot/budget') return t('autopilot.errorBudget')
+			if (error.code === 'autopilot/invalid') return t('autopilot.errorInvalid')
+			return error.message || ''
+		}
+
+		/** Deep-merge a configure patch onto a config value (laneCaps/budget are nested). */
+		function applyAutopilotPatch(base, patch) {
+			const current = base && typeof base === 'object' ? base : null
+			if (!patch || typeof patch !== 'object') return current
+			const next = { ...(current || {}) }
+			for (const key of Object.keys(patch)) {
+				const value = patch[key]
+				if (key === 'laneCaps' && value && typeof value === 'object') {
+					next.laneCaps = { ...((current && current.laneCaps) || {}), ...value }
+				} else if (key === 'budget' && value && typeof value === 'object') {
+					next.budget = { ...((current && current.budget) || {}), ...value }
+				} else {
+					next[key] = value
+				}
+			}
+			return next
+		}
+
+		/** Merge two pending patches so one debounced request carries every change. */
+		function mergeAutopilotPatch(left, right) {
+			const base = left && typeof left === 'object' ? left : {}
+			if (!right || typeof right !== 'object') return { ...base }
+			const next = { ...base, ...right }
+			for (const key of ['laneCaps', 'budget']) {
+				const a = base[key] && typeof base[key] === 'object' ? base[key] : null
+				const b = right[key] && typeof right[key] === 'object' ? right[key] : null
+				if (a || b) next[key] = { ...(a || {}), ...(b || {}) }
+			}
+			return next
+		}
+
+		/**
+		 * Debounced configure queue: rapid control changes are merged into one
+		 * `{op:'configure'}` call after `delayMs`. Deterministic and injectable so a
+		 * test can drive it with fake timers.
+		 */
+		function createAutopilotCommitQueue(timers, delayMs, send) {
+			const clock = timers && typeof timers === 'object' ? timers : { setTimeout: () => null, clearTimeout: () => {} }
+			const delay = Number.isFinite(delayMs) ? Math.max(0, delayMs) : AUTOPILOT_COMMIT_MS
+			const sender = typeof send === 'function' ? send : () => {}
+			let timer = null
+			let patch = null
+			const flush = () => {
+				timer = null
+				const current = patch
+				patch = null
+				if (current && Object.keys(current).length > 0) sender(current)
+			}
+			return {
+				push(nextPatch) {
+					if (!nextPatch || typeof nextPatch !== 'object') return null
+					patch = mergeAutopilotPatch(patch, nextPatch)
+					if (timer !== null) clock.clearTimeout(timer)
+					timer = clock.setTimeout(flush, delay)
+					return { ...patch }
+				},
+				pending() {
+					return patch ? { ...patch } : null
+				},
+				hasTimer() {
+					return timer !== null
+				},
+				cancel() {
+					if (timer !== null) clock.clearTimeout(timer)
+					timer = null
+					patch = null
+				},
+				flushNow() {
+					if (timer !== null) clock.clearTimeout(timer)
+					flush()
+				},
+			}
+		}
+
+		/** Config from a `status`/`configure` response value (`{config,...}` or a bare config). */
+		function autopilotConfigFromStatus(value) {
+			if (!value || typeof value !== 'object') return null
+			const raw = value.config && typeof value.config === 'object' ? value.config : value
+			return normalizeAutopilotConfig(raw)
+		}
+
+		/** Header/toggle status derived from the view plus optimistic values. */
+		function autopilotStateLabel(state) {
+			if (!state || state.available !== true) return 'unavailable'
+			if (!state.values || state.values.enabled !== true) return 'off'
+			if (state.paused) return 'paused'
+			return 'on'
+		}
+
+		/** Pulse-now guards: on, not paused, and no request of any kind in flight. */
+		function canPulseAutopilot(state) {
+			return Boolean(
+				state &&
+					state.available === true &&
+					state.values &&
+					state.values.enabled === true &&
+					state.paused !== true &&
+					state.busy === null,
+			)
+		}
+
+		/**
+		 * Preview guard. A disabled autopilot hides preview with Pulse now behind
+		 * the toggle (KB-76 AC 5) instead of offering a control whose plan can only
+		 * say "Autopilot is disabled".
+		 */
+		function canPreviewAutopilot(state) {
+			return Boolean(
+				state && state.available === true && state.values && state.values.enabled === true && state.busy === null,
+			)
+		}
+
+		/**
+		 * One reducer for the whole control surface. It is the only place a request
+		 * can be started (so a double click cannot double-fire a pulse) and it owns
+		 * the optimistic value + rollback contract for `configure`.
+		 */
+		function reduceAutopilot(state, action) {
+			const current = state && typeof state === 'object' ? state : initialAutopilotUi(null)
+			const type = action && typeof action.type === 'string' ? action.type : ''
+			switch (type) {
+				case 'reset':
+					return initialAutopilotUi(action.workspaceId)
+				case 'sync': {
+					const config = action.config && typeof action.config === 'object' ? action.config : null
+					const next = {
+						...current,
+						available: action.available === true || Boolean(config),
+						config,
+						confirmed: config || current.confirmed,
+						pauseCause: typeof action.pauseCause === 'string' && action.pauseCause ? action.pauseCause : null,
+						paused: Boolean(action.pauseCause),
+						membersPaused: action.membersPaused === true,
+						budget: action.budget && typeof action.budget === 'object' ? action.budget : null,
+						nextTickAt: Number.isFinite(action.nextTickAt) ? action.nextTickAt : null,
+						lastPulse: action.lastPulse && typeof action.lastPulse === 'object' ? action.lastPulse : null,
+					}
+					// An unacknowledged optimistic edit keeps its value; only the rollback
+					// target is refreshed, so a poll can never resurrect a stale config.
+					return current.dirty ? { ...next, values: current.values } : { ...next, values: config }
+				}
+				case 'configure/optimistic': {
+					const patch = action.patch && typeof action.patch === 'object' ? action.patch : null
+					if (!patch) return current
+					return {
+						...current,
+						dirty: true,
+						error: null,
+						values: applyAutopilotPatch(current.values, patch),
+						// A plan built for the previous settings is no longer proof.
+						preview: action.keepPreview === true ? current.preview : null,
+					}
+				}
+				case 'configure/send':
+					return {
+						...current,
+						seq: Number.isInteger(action.seq) ? action.seq : current.seq + 1,
+						busy: 'configure',
+						phase: 'saving',
+						error: null,
+						dirty: true,
+					}
+				case 'configure/ok': {
+					if (Number.isInteger(action.seq) && action.seq < current.seq) return current
+					const config = action.config && typeof action.config === 'object' ? action.config : current.values
+					return { ...current, busy: null, phase: 'idle', dirty: false, error: null, config, confirmed: config, values: config }
+				}
+				case 'configure/fail': {
+					if (Number.isInteger(action.seq) && action.seq < current.seq) return current
+					return {
+						...current,
+						busy: null,
+						phase: 'idle',
+						dirty: false,
+						error: normalizeAutopilotError(action.error),
+						values: current.confirmed || current.values,
+						preview: null,
+					}
+				}
+				case 'preview/start':
+					return { ...current, busy: 'preview', error: null }
+				case 'preview/ok':
+					return {
+						...current,
+						busy: null,
+						preview: action.plan && typeof action.plan === 'object' ? action.plan : null,
+						previewAt: safeNumber(action.at, 0),
+					}
+				case 'preview/fail':
+					return { ...current, busy: null, error: normalizeAutopilotError(action.error) }
+				case 'preview/clear':
+					return { ...current, preview: null, previewAt: 0 }
+				case 'pulse/start':
+					// The busy guard lives in the reducer: a second dispatch is a no-op.
+					if (!canPulseAutopilot(current)) return current
+					return { ...current, busy: 'pulse', error: null, pulse: null, preview: null }
+				case 'pulse/ok':
+					return { ...current, busy: null, pulse: action.pulse && typeof action.pulse === 'object' ? action.pulse : null }
+				case 'pulse/fail':
+					return { ...current, busy: null, error: normalizeAutopilotError(action.error) }
+				case 'error/dismiss':
+					return { ...current, error: null }
+				case 'phase1/show':
+					return { ...current, phase1: true }
+				case 'phase1/dismiss':
+					return { ...current, phase1: false }
+				default:
+					return current
+			}
+		}
+
+		/** Localized reason label; unknown/newer codes stay visible instead of blank. */
+		function autopilotReasonLabel(code, t) {
+			const value = typeof code === 'string' && code ? code : 'unknown'
+			if (AUTOPILOT_REASON_CODES.indexOf(value) === -1) return t('autopilot.reasonUnknown', { code: value })
+			return t('autopilot.reason.' + value)
+		}
+
+		/** `[{code,count,label,text}]`, highest count first; used by the empty-plan line. */
+		function autopilotReasonSummary(plan, t) {
+			const counts = new Map()
+			safeArray(plan && plan.skips).forEach((entry) => {
+				const code = entry && typeof entry.reason === 'string' && entry.reason ? entry.reason : 'unknown'
+				if (code === 'admitted') return
+				counts.set(code, (counts.get(code) || 0) + 1)
+			})
+			return Array.from(counts.entries())
+				.sort((left, right) => right[1] - left[1] || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+				.map(([code, count]) => {
+					const label = autopilotReasonLabel(code, t)
+					return { code, count, label, text: t('autopilot.reasonCount', { label, count: String(count) }) }
+				})
+		}
+
+		/**
+		 * Render model for a dry-run plan: activations first in plan order, then the
+		 * skip rows, each joined to the live ticket title and roster member. Purely a
+		 * projection — it never mutates the plan and never starts anything.
+		 */
+		function buildAutopilotPreview(plan, tickets, roster, t, roleName) {
+			const ticketsById = new Map()
+			safeArray(tickets).forEach((ticket) => {
+				if (ticket && typeof ticket.id === 'string') ticketsById.set(ticket.id, ticket)
+			})
+			const membersById = new Map()
+			safeArray(roster).forEach((member) => {
+				if (member && typeof member.id === 'string') membersById.set(member.id, member)
+			})
+			const source = plan && typeof plan === 'object' ? plan : null
+			const decisions = safeArray(source && source.decisions)
+				.filter((entry) => entry && typeof entry === 'object')
+				.slice()
+				.sort((left, right) => safeNumber(left.order, 0) - safeNumber(right.order, 0))
+			const skips = safeArray(source && source.skips).filter((entry) => entry && typeof entry === 'object')
+			const rows = []
+			const pushRow = (kind, entry, index) => {
+				const ticketId = safeString(entry.ticketId) || null
+				const ticket = ticketId ? ticketsById.get(ticketId) : null
+				const member = entry.memberId ? membersById.get(entry.memberId) : null
+				// Dispatch rows carry the resolved role; skip rows may only carry the
+				// member, so fall back to that member's roster role (AC 3: id + title,
+				// member name + role, lane, reason).
+				const role =
+					safeString(entry.role) ||
+					(member ? safeString(member.roleId) || safeString(member.roleName) : '')
+				const lane = AUTOPILOT_LANES.indexOf(entry.lane) === -1 ? null : entry.lane
+				rows.push({
+					key: kind + ':' + String(ticketId || 'board') + ':' + String(index),
+					kind,
+					ordinal: index + 1,
+					ticketId,
+					title: ticket ? safeString(ticket.title) : '',
+					memberName: safeString(entry.memberName) || (member ? safeString(member.name) : ''),
+					memberRole: role ? (typeof roleName === 'function' ? roleName(role) : '') : '',
+					lane,
+					laneLabel: lane ? t('autopilot.lane.' + lane) : '',
+					reasonCode: safeString(entry.reason) || 'unknown',
+					reason: autopilotReasonLabel(entry.reason, t),
+					detail: safeString(entry.detail),
+				})
+			}
+			decisions.forEach((entry, index) => pushRow('dispatch', entry, index))
+			skips.forEach((entry, index) => pushRow('skip', entry, decisions.length + index))
+			const summary = autopilotReasonSummary(source, t)
+			return {
+				rows,
+				dispatchCount: decisions.length,
+				skipCount: skips.length,
+				empty: decisions.length === 0,
+				summary,
+				summaryText: summary.map((item) => item.text).join(' · '),
+				generatedAt: safeNumber(source && source.generatedAt, 0),
+			}
+		}
+
+		/** Budget read-out strings (numbers interpolated through the locale helper). */
+		function autopilotBudgetRows(budget, t) {
+			if (!budget || !budget.hour || !budget.day) return []
+			return [
+				t('autopilot.budgetHour', {
+					remaining: String(safeNumber(budget.hour.remaining, 0)),
+					limit: String(safeNumber(budget.hour.limit, 0)),
+				}),
+				t('autopilot.budgetDay', {
+					remaining: String(safeNumber(budget.day.remaining, 0)),
+					limit: String(safeNumber(budget.day.limit, 0)),
+				}),
+			]
+		}
+
+		// ------------------------------------------------------------------
+		// Autopilot observability (KB-77) — pulse feed, lane admission, member
+		// autopilot state, next-tick countdown and deduplicated alerts
+		// ------------------------------------------------------------------
+		//
+		// Everything below is a pure projection or reducer over the shipped
+		// snapshot fields: `board.pulses` (newest-first normalized ring),
+		// `board.team.members[].lastActivatedAt`, ticket execution rows,
+		// `snapshot.now` and `snapshot.autopilot` (`config`, `nextTickAt`,
+		// `lastPulse`, `budgetRemaining`). The client never recomputes admission
+		// policy: lane occupancy mirrors the host's origin-anchored rule and the
+		// pulse records explain themselves. No DOM or wall clock is touched here,
+		// so the whole surface is testable with fake timers.
+
+		const AUTOPILOT_FEED_MAX = 20 // AC 1: the feed lists the newest ≤20 pulses
+		const AUTOPILOT_PULSE_KEEP = 50 // AC 5: keep the host ring so alerts persist
+		// AC 1 names exactly these three triggers; the host normalizes anything else
+		// (a legacy `restart` row included) to `manual`.
+		const AUTOPILOT_TRIGGERS = ['timer', 'manual', 'resume']
+		// Reasons that surface as an operator alert (AC 5): postcondition failure,
+		// loop guard and an exhausted dispatch budget. A pulse-level `error` is the
+		// "failed dispatch" family and is alerted under the same pulse id.
+		const AUTOPILOT_ALERT_REASONS = ['postcondition-failed', 'loop-guard', 'budget-exhausted']
+		const AUTOPILOT_LANE_BY_COLUMN = { backlog: 'refine', ready: 'implement', in_progress: 'implement', review: 'review' }
+		// The planner's live-execution set (KB-69 §13): a ticket occupies a lane
+		// while its execution row is one of these.
+		const AUTOPILOT_LIVE_EXECUTION = ['running', 'idle', 'blocked', 'paused']
+		const AUTOPILOT_ALERT_ERROR = 'pulse-error'
+
+		function autopilotTriggerLabel(trigger, t) {
+			const value = AUTOPILOT_TRIGGERS.indexOf(safeString(trigger)) === -1 ? 'manual' : trigger
+			return t('autopilot.trigger.' + value)
+		}
+
+		/** Local `HH:mm:ss` for a pulse; locale/time zone injectable for tests. */
+		function formatAutopilotPulseTime(at, options) {
+			const stamp = safeNumber(at, 0)
+			if (!stamp) return ''
+			const opts = options && typeof options === 'object' ? options : {}
+			try {
+				return new Intl.DateTimeFormat(opts.locale || undefined, {
+					hour: '2-digit',
+					minute: '2-digit',
+					second: '2-digit',
+					...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
+				}).format(new Date(stamp))
+			} catch (error) {
+				return ''
+			}
+		}
+
+		/** Full local timestamp for the row title (tooltip / accessible context). */
+		function formatAutopilotPulseStamp(at, options) {
+			const stamp = safeNumber(at, 0)
+			if (!stamp) return ''
+			const opts = options && typeof options === 'object' ? options : {}
+			try {
+				return new Intl.DateTimeFormat(opts.locale || undefined, {
+					dateStyle: 'medium',
+					timeStyle: 'medium',
+					...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
+				}).format(new Date(stamp))
+			} catch (error) {
+				return ''
+			}
+		}
+
+		/** Localized duration: `…s`/`… ms`, with an explicit unknown marker. */
+		function formatAutopilotDuration(durationMs, t) {
+			const value = safeNumber(durationMs, -1)
+			if (value < 0) return t('autopilot.feedDurationUnknown')
+			if (value < 1000) return t('autopilot.durationMs', { value: String(Math.round(value)) })
+			return t('autopilot.durationSeconds', { value: (Math.round(value / 100) / 10).toFixed(1) })
+		}
+
+		function autopilotPulseDecisions(pulse) {
+			return safeArray(pulse && pulse.decisions).filter((entry) => entry && typeof entry === 'object')
+		}
+
+		function autopilotPulseDispatches(pulse) {
+			return safeArray(pulse && pulse.dispatched).filter((entry) => entry && typeof entry === 'object')
+		}
+
+		/** Error family recorded by a pulse: pulse-level error, failing decisions, outcomes. */
+		function autopilotPulseAlertReasons(pulse) {
+			const codes = []
+			if (pulse && typeof pulse.error === 'string' && pulse.error) codes.push(AUTOPILOT_ALERT_ERROR)
+			autopilotPulseDecisions(pulse).forEach((entry) => {
+				const code = safeString(entry.reason)
+				if (AUTOPILOT_ALERT_REASONS.indexOf(code) !== -1 && codes.indexOf(code) === -1) codes.push(code)
+			})
+			safeArray(pulse && pulse.outcomes).forEach((entry) => {
+				if (entry && entry.outcome === 'postcondition-failed' && codes.indexOf('postcondition-failed') === -1) {
+					codes.push('postcondition-failed')
+				}
+			})
+			return codes
+		}
+
+		/** Lane group a ticket column belongs to, or null for done/blocked. */
+		function autopilotLaneOfTicket(ticket) {
+			const column = safeString(ticket && ticket.column)
+			return AUTOPILOT_LANE_BY_COLUMN[column] || null
+		}
+
+		/**
+		 * Lane group a live session occupies. Mirrors the shipped host rule
+		 * (KB-71): an autopilot execution stays in the lane it was dispatched FROM
+		 * (`startColumn`) even after the ticket moved on, so a refine PM that
+		 * claimed Ready still holds the refine lane.
+		 */
+		function autopilotExecutionLane(ticket) {
+			const execution = executionOf(ticket)
+			const status = safeString(execution && execution.status)
+			if (!execution || AUTOPILOT_LIVE_EXECUTION.indexOf(status) === -1) return null
+			const startColumn = safeString(execution.startColumn)
+			if (execution.origin === 'autopilot' && AUTOPILOT_LANE_BY_COLUMN[startColumn]) return AUTOPILOT_LANE_BY_COLUMN[startColumn]
+			return autopilotLaneOfTicket(ticket)
+		}
+
+		/** Live-session occupancy per lane group, derived from ticket execution rows. */
+		function autopilotLaneOccupancy(tickets) {
+			const occupancy = { refine: 0, implement: 0, review: 0 }
+			safeArray(tickets).forEach((ticket) => {
+				const lane = autopilotExecutionLane(ticket)
+				if (lane) occupancy[lane] += 1
+			})
+			return occupancy
+		}
+
+		/**
+		 * One lane header admission chip (AC 2). The state is `paused` when
+		 * admission is suspended (board paused, autopilot off, or cap 0), `busy`
+		 * when occupancy reaches the configured cap, `idle` otherwise. The
+		 * capacity label always uses the configured cap, never the occupancy, so
+		 * caps >1 read correctly.
+		 */
+		function autopilotLaneAdmission(lane, options, t) {
+			const opts = options && typeof options === 'object' ? options : {}
+			const config = opts.config && typeof opts.config === 'object' ? opts.config : null
+			const caps = config && config.laneCaps && typeof config.laneCaps === 'object' ? config.laneCaps : {}
+			const cap = Math.max(0, Math.round(safeNumber(caps[lane], 0)))
+			const occupancyMap = opts.occupancy && typeof opts.occupancy === 'object' ? opts.occupancy : {}
+			const occupancy = Math.max(0, Math.round(safeNumber(occupancyMap[lane], 0)))
+			const enabled = opts.available === true && Boolean(config) && config.enabled === true
+			const suspended = opts.paused === true || !enabled || cap <= 0
+			const state = suspended ? 'paused' : occupancy >= cap ? 'busy' : 'idle'
+			const laneLabel = t('autopilot.lane.' + lane)
+			const stateLabel = t('autopilot.laneAdmission.' + state)
+			const capacityText = t('autopilot.laneAdmission.capacity', { occupancy: String(occupancy), cap: String(cap) })
+			return {
+				lane,
+				state,
+				stateLabel,
+				capacityText,
+				occupancy,
+				cap,
+				ariaLabel: t('autopilot.laneAdmission.aria', {
+					lane: laneLabel,
+					state: stateLabel,
+					occupancy: String(occupancy),
+					cap: String(cap),
+				}),
+			}
+		}
+
+		/** Admission view for every lane group; the Board passes one chip per column. */
+		function autopilotLaneAdmissions(options, t) {
+			const opts = options && typeof options === 'object' ? options : {}
+			const out = {}
+			AUTOPILOT_LANES.forEach((lane) => {
+				out[lane] = autopilotLaneAdmission(lane, opts, t)
+			})
+			return out
+		}
+
+		/**
+		 * Autopilot state for one roster member (AC 3): `active` on a held ticket,
+		 * `active` for a running session without a ticket, `idle` for a linked
+		 * session at rest, `paused` when the user paused the member (never conflated
+		 * with no work), and `no-work` when the member holds nothing claimable.
+		 * `lastActivatedAt` is the persisted fairness key (KB-69 §13); the roster
+		 * read model's `lastActivityAt` is the fallback for older boards.
+		 */
+		function memberAutopilotState(member, view, t) {
+			const row = member && typeof member === 'object' ? member : {}
+			const ticket = row.currentTicket && typeof row.currentTicket === 'object' ? row.currentTicket : null
+			const ticketId = safeString(ticket && ticket.id)
+			const ticketColumn = safeString(ticket && ticket.column)
+			const status = safeString(row.status)
+			const activatedMap = view && view.memberActivatedAt && typeof view.memberActivatedAt === 'object' ? view.memberActivatedAt : {}
+			// The persisted fairness key is the activation time; older boards (and
+			// members without a stamp) fall back to the roster's last activity.
+			const lastActivatedAt = safeNumber(activatedMap[row.id], 0) || safeNumber(row.lastActivityAt, 0)
+			const paused = row.paused === true
+			let kind
+			let label
+			if (paused) {
+				kind = 'paused'
+				label = t('autopilot.member.paused')
+			} else if (status === 'running') {
+				// Only a genuinely executing agent is "active"; a member at rest is
+				// never labelled with the old ticket-ownership meaning of active.
+				kind = 'active'
+				label = ticketId ? t('autopilot.member.active', { id: ticketId }) : t('autopilot.member.activeSession')
+			} else if (ticketId) {
+				// At rest with a next piece of work: In Progress means the member can
+				// resume their own ticket; a Review focus means their review queue.
+				kind = 'idle'
+				label = ticketColumn === 'in_progress'
+					? t('autopilot.member.resume', { id: ticketId })
+					: t('autopilot.member.next', { id: ticketId })
+			} else if (status === 'idle') {
+				kind = 'idle'
+				label = t('autopilot.member.idle')
+			} else {
+				kind = 'no-work'
+				label = t('autopilot.member.noWork')
+			}
+			const lastActiveText = lastActivatedAt
+				? t('autopilot.member.lastActive', { ago: formatAge(lastActivatedAt, t) })
+				: t('autopilot.member.neverActive')
+			return {
+				kind,
+				label,
+				chipText: t('autopilot.member.chip', { state: label }),
+				ticketId: ticketId || null,
+				lastActivatedAt: lastActivatedAt || null,
+				lastActiveText,
+				ariaLabel: t('autopilot.member.aria', { state: label, time: lastActiveText }),
+			}
+		}
+
+		/** Newest-first pulse order; ties break on id so a re-poll is byte-stable. */
+		function autopilotPulseKeyCompare(left, right) {
+			const at = safeNumber(right && right.at, 0) - safeNumber(left && left.at, 0)
+			if (at !== 0) return at
+			const leftId = safeString(left && left.id)
+			const rightId = safeString(right && right.id)
+			return leftId < rightId ? -1 : leftId > rightId ? 1 : 0
+		}
+
+		/**
+		 * Merge a poll's pulse ring into local state by id (AC 9): a duplicate poll
+		 * can never duplicate a row, and the newest version of a pulse wins.
+		 */
+		function mergeAutopilotPulses(existing, incoming) {
+			const byId = new Map()
+			safeArray(existing).forEach((pulse) => {
+				if (pulse && typeof pulse.id === 'string' && pulse.id) byId.set(pulse.id, pulse)
+			})
+			safeArray(incoming).forEach((pulse) => {
+				if (pulse && typeof pulse.id === 'string' && pulse.id) byId.set(pulse.id, pulse)
+			})
+			return Array.from(byId.values()).sort(autopilotPulseKeyCompare).slice(0, AUTOPILOT_PULSE_KEEP)
+		}
+
+		function initialAutopilotPulseState() {
+			return { hostNow: null, pulses: [], acked: [] }
+		}
+
+		/**
+		 * Pure pulse state: merge polls by pulse id, ignore an out-of-order poll
+		 * (older host clock), and remember acknowledged alerts per pulse id so a
+		 * poll can neither clear an unread alert nor resurrect a dismissed one.
+		 */
+		function reduceAutopilotPulseState(state, action) {
+			const current = state && typeof state === 'object' ? state : initialAutopilotPulseState()
+			const type = action && typeof action.type === 'string' ? action.type : ''
+			if (type === 'reset') return initialAutopilotPulseState()
+			if (type === 'ack') {
+				const pulseId = safeString(action.pulseId)
+				if (!pulseId || current.acked.indexOf(pulseId) !== -1) return current
+				return { ...current, acked: current.acked.concat([pulseId]).slice(-AUTOPILOT_PULSE_KEEP) }
+			}
+			if (type === 'sync') {
+				const hostNow = Number.isFinite(action.hostNow) ? action.hostNow : null
+				if (hostNow === null) return current
+				if (current.hostNow !== null && hostNow < current.hostNow) return current
+				const pulses = mergeAutopilotPulses(current.pulses, action.pulses)
+				const sameLength = pulses.length === current.pulses.length
+				const unchanged = sameLength && pulses.every((pulse, index) => pulse === current.pulses[index])
+				if (unchanged && hostNow === current.hostNow) return current
+				return { ...current, hostNow, pulses }
+			}
+			return current
+		}
+
+		/**
+		 * Deduplicated alert rows (AC 5): one row per pulse id that carries a
+		 * pulse-level error or one of the error-family reasons. Acknowledgement is
+		 * per pulse id and survives every poll. The projection is non-destructive:
+		 * it only hides acknowledged rows, it never rewrites the pulse.
+		 */
+		function buildAutopilotAlerts(pulses, acked, tickets, t, options) {
+			const acknowledged = {}
+			safeArray(acked).forEach((id) => {
+				const key = safeString(id)
+				if (key) acknowledged[key] = true
+			})
+			const ticketsById = new Map()
+			safeArray(tickets).forEach((ticket) => {
+				if (ticket && typeof ticket.id === 'string') ticketsById.set(ticket.id, ticket)
+			})
+			const alerts = []
+			safeArray(pulses).forEach((pulse) => {
+				const pulseId = safeString(pulse && pulse.id)
+				if (!pulseId || acknowledged[pulseId]) return
+				const codes = autopilotPulseAlertReasons(pulse)
+				if (codes.length === 0) return
+				const pulseError = safeString(pulse.error)
+				// The authoritative dispatch ledger: an `admitted` plan row missing from it
+				// never started a session (same rule as the feed's `notExecuted`).
+				const dispatchedIds = new Set()
+				autopilotPulseDispatches(pulse).forEach((entry) => {
+					const id = safeString(entry && entry.ticketId)
+					if (id) dispatchedIds.add(id)
+				})
+				const ticketIds = []
+				const addTicket = (value) => {
+					const id = safeString(value)
+					if (id && ticketIds.indexOf(id) === -1 && ticketsById.has(id)) ticketIds.push(id)
+				}
+				autopilotPulseDecisions(pulse).forEach((entry) => {
+					const reason = safeString(entry.reason)
+					if (AUTOPILOT_ALERT_REASONS.indexOf(reason) !== -1) addTicket(entry.ticketId)
+					// Failed dispatch (AC 5): the host keeps the planned `admitted` row but
+					// throws before writing the ledger, so that ticket is the one to link.
+					if (pulseError && reason === 'admitted' && entry.action === 'dispatch') {
+						const id = safeString(entry.ticketId)
+						if (id && !dispatchedIds.has(id)) addTicket(id)
+					}
+				})
+				safeArray(pulse.outcomes).forEach((entry) => {
+					if (entry && entry.outcome === 'postcondition-failed') addTicket(entry.ticketId)
+				})
+				alerts.push({
+					key: pulseId,
+					pulseId,
+					at: safeNumber(pulse.at, 0),
+					time: formatAutopilotPulseTime(pulse.at, options),
+					reasons: (pulseError ? [t('autopilot.reason.dispatch-failed')] : []).concat(
+						codes.filter((code) => code !== AUTOPILOT_ALERT_ERROR).map((code) => autopilotReasonLabel(code, t)),
+					),
+					message: pulseError ? t('autopilot.alert.pulseError', { message: pulseError }) : '',
+					ticketIds,
+				})
+			})
+			return alerts.sort(autopilotPulseKeyCompare).slice(0, AUTOPILOT_FEED_MAX)
+		}
+
+		/**
+		 * Render model for the pulse feed (AC 1): newest ≤20 pulses newest-first
+		 * with trigger, local time, duration, dispatched count, skipped count and an
+		 * error marker; each row carries the full decision list plus the authoritative
+		 * `dispatched` ledger. A plan `admitted` row that is missing from `dispatched`
+		 * is marked as skipped at dispatch instead of pretending a session started.
+		 */
+		function buildAutopilotFeed(pulses, tickets, roster, t, roleName, options) {
+			const ticketsById = new Map()
+			safeArray(tickets).forEach((ticket) => {
+				if (ticket && typeof ticket.id === 'string') ticketsById.set(ticket.id, ticket)
+			})
+			const membersById = new Map()
+			safeArray(roster).forEach((member) => {
+				if (member && typeof member.id === 'string') membersById.set(member.id, member)
+			})
+			const roleLabel = (roleId) => {
+				if (!roleId) return ''
+				return typeof roleName === 'function' ? roleName(roleId) : safeString(roleId)
+			}
+			const rows = safeArray(pulses)
+				.filter((pulse) => pulse && typeof pulse === 'object')
+				.slice()
+				.sort(autopilotPulseKeyCompare)
+				.slice(0, AUTOPILOT_FEED_MAX)
+				.map((pulse) => {
+					const pulseId = safeString(pulse.id) || 'pulse-' + String(safeNumber(pulse.at, 0))
+					const decisions = autopilotPulseDecisions(pulse)
+					const dispatches = autopilotPulseDispatches(pulse)
+					const executedIds = new Set()
+					const executed = dispatches.map((entry, index) => {
+						const ticketId = safeString(entry.ticketId)
+						if (ticketId) executedIds.add(ticketId)
+						const ticket = ticketId ? ticketsById.get(ticketId) : null
+						const member = safeString(entry.memberId) ? membersById.get(safeString(entry.memberId)) : null
+						return {
+							key: 'executed:' + pulseId + ':' + String(index),
+							ticketId: ticketId || null,
+							ticketTitle: ticket ? safeString(ticket.title) : '',
+							memberName: member ? safeString(member.name) : safeString(entry.memberId),
+							sessionId: safeString(entry.sessionId),
+						}
+					})
+					const decisionRows = decisions.map((entry, index) => {
+						const action = entry.action === 'dispatch' ? 'dispatch' : 'skip'
+						const reasonCode = safeString(entry.reason) || 'unknown'
+						const ticketId = safeString(entry.ticketId)
+						const ticket = ticketId ? ticketsById.get(ticketId) : null
+						const member = safeString(entry.memberId) ? membersById.get(safeString(entry.memberId)) : null
+						const lane = AUTOPILOT_LANES.indexOf(entry.lane) === -1 ? null : entry.lane
+						const memberName = safeString(entry.memberName) || (member ? safeString(member.name) : '')
+						const notExecuted = action === 'dispatch' && reasonCode === 'admitted' && Boolean(ticketId) && !executedIds.has(ticketId)
+						return {
+							key: 'decision:' + pulseId + ':' + String(index),
+							action,
+							actionLabel: t('autopilot.action.' + action),
+							ticketId: ticketId || null,
+							ticketTitle: ticket ? safeString(ticket.title) : '',
+							memberName,
+							memberRole: roleLabel(safeString(entry.role) || (member ? safeString(member.roleId) : '')),
+							lane,
+							laneLabel: lane ? t('autopilot.lane.' + lane) : t('autopilot.boardLevel'),
+							reasonCode,
+							reason: autopilotReasonLabel(reasonCode, t),
+							detail: safeString(entry.detail),
+							alert: AUTOPILOT_ALERT_REASONS.indexOf(reasonCode) !== -1,
+							notExecuted,
+							notExecutedText: notExecuted ? t('autopilot.feedDispatchSkipped') : '',
+						}
+					})
+					const errorCodes = autopilotPulseAlertReasons(pulse)
+					const trigger = AUTOPILOT_TRIGGERS.indexOf(safeString(pulse.trigger)) === -1 ? 'manual' : pulse.trigger
+					return {
+						key: pulseId,
+						id: pulseId,
+						at: safeNumber(pulse.at, 0),
+						time: formatAutopilotPulseTime(pulse.at, options),
+						stamp: formatAutopilotPulseStamp(pulse.at, options),
+						trigger,
+						triggerLabel: autopilotTriggerLabel(trigger, t),
+						durationText: formatAutopilotDuration(pulse.durationMs, t),
+						dispatchedCount: dispatches.length,
+						skippedCount: decisions.filter((entry) => entry.action === 'skip').length,
+						hasError: errorCodes.length > 0,
+						errorLabel: t('autopilot.feedErrorMarker'),
+						errorText: errorCodes
+							.filter((code) => code !== AUTOPILOT_ALERT_ERROR)
+							.map((code) => autopilotReasonLabel(code, t))
+							.concat(safeString(pulse.error) ? [safeString(pulse.error)] : [])
+							.join(' · '),
+						decisions: decisionRows,
+						executed,
+					}
+				})
+			return { rows, total: rows.length }
+		}
+
+		/**
+		 * Which state the feed section renders (AC 6). `loading` wins so the first
+		 * poll cannot flash the empty state, and an unavailable host gets its own
+		 * explanation instead of an empty feed.
+		 */
+		function autopilotFeedState(options) {
+			const opts = options && typeof options === 'object' ? options : {}
+			if (opts.loading === true) return 'loading'
+			if (opts.available !== true) return 'unavailable'
+			if (safeArray(opts.pulses).length === 0) return 'empty'
+			return 'ready'
+		}
+
+		// -- Next-tick countdown (AC 4) --------------------------------------
+
+		function initialAutopilotCountdown() {
+			return {
+				hostNow: null,
+				syncedLocalAt: null,
+				nextTickAt: null,
+				available: false,
+				enabled: false,
+				paused: false,
+				seconds: null,
+			}
+		}
+
+		/** `running` only when the host actually has an armed tick. */
+		function autopilotCountdownMode(state) {
+			if (!state || state.available !== true) return 'off'
+			if (state.enabled !== true) return 'off'
+			if (state.paused === true) return 'paused'
+			if (!Number.isFinite(state.nextTickAt)) return 'off'
+			return 'running'
+		}
+
+		/**
+		 * Whole seconds left, projected from the host clock captured at the last
+		 * poll (`hostNow + (localNow - syncedLocalAt)`) rather than from a second
+		 * local clock. Re-syncing every poll keeps the label within 2 s of the host
+		 * value even if the local clock drifts.
+		 */
+		function autopilotCountdownRemaining(state, localNow) {
+			if (!state || !Number.isFinite(state.nextTickAt) || state.hostNow === null || state.syncedLocalAt === null) return null
+			const drift = Math.max(0, safeNumber(localNow, state.syncedLocalAt) - state.syncedLocalAt)
+			return Math.ceil((state.nextTickAt - (state.hostNow + drift)) / 1000)
+		}
+
+		function autopilotCountdownSeconds(state, localNow) {
+			const remaining = autopilotCountdownRemaining(state, localNow)
+			return remaining === null ? null : Math.max(0, remaining)
+		}
+
+		/**
+		 * Pure countdown reducer. `tick` returns the same state object when the
+		 * displayed second did not change, so the component re-renders at most once
+		 * per second; `off`/`paused` are sticky and a `tick` never advances them.
+		 */
+		function reduceAutopilotCountdown(state, action) {
+			const current = state && typeof state === 'object' ? state : initialAutopilotCountdown()
+			const type = action && typeof action.type === 'string' ? action.type : ''
+			if (type === 'reset') return initialAutopilotCountdown()
+			if (type === 'sync') {
+				const hostNow = Number.isFinite(action.hostNow) ? action.hostNow : null
+				const localNow = Number.isFinite(action.localNow) ? action.localNow : null
+				if (hostNow === null || localNow === null) return current
+				// A poll that arrives out of order must not move the countdown
+				// backwards (AC 9): the older host clock is ignored outright.
+				if (current.hostNow !== null && hostNow < current.hostNow) return current
+				const nextTickAt = Number.isFinite(action.nextTickAt) ? action.nextTickAt : null
+				const next = {
+					...current,
+					hostNow,
+					syncedLocalAt: localNow,
+					nextTickAt,
+					available: action.available === true,
+					enabled: action.enabled === true,
+					paused: action.paused === true,
+				}
+				next.seconds = autopilotCountdownSeconds(next, localNow)
+				return next
+			}
+			if (type === 'tick') {
+				if (autopilotCountdownMode(current) !== 'running') return current
+				const seconds = autopilotCountdownSeconds(current, action.localNow)
+				if (seconds === null || seconds === current.seconds) return current
+				return { ...current, seconds }
+			}
+			return current
+		}
+
+		/** `mm:ss`, or the explicit off/paused word (AC 4). */
+		function autopilotCountdownLabel(state, t) {
+			const mode = autopilotCountdownMode(state)
+			if (mode === 'off') return t('autopilot.countdown.off')
+			if (mode === 'paused') return t('autopilot.countdown.paused')
+			const seconds = Math.max(0, safeNumber(state && state.seconds, 0))
+			const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
+			const ss = String(seconds % 60).padStart(2, '0')
+			return t('autopilot.countdown.value', { mm, ss })
+		}
+
+		function autopilotCountdownAria(state, t) {
+			return t('autopilot.countdown.aria', { value: autopilotCountdownLabel(state, t) })
+		}
+
 		function readStoredWorkspace() {
 			try {
 				const raw = window.localStorage.getItem(STORAGE_KEY)
@@ -201,6 +1287,139 @@ window.__ModuleLoader__.load({
 			'header.close': 'Close',
 			'header.speakThought': 'Speak a thought',
 			'header.thoughts': 'Thoughts',
+
+			// KB-76 autopilot controls: header entry, settings popover, dry-run
+			// preview, pulse now, paused/off/unavailable states and inline errors.
+			'autopilot.entry': 'Autopilot',
+			'autopilot.entryState': 'Autopilot — {state}',
+			'autopilot.title': 'Autopilot controls',
+			'autopilot.state.on': 'On',
+			'autopilot.state.off': 'Off',
+			'autopilot.state.paused': 'Paused',
+			'autopilot.state.unavailable': 'Unavailable',
+			'autopilot.toggleLabel': 'Autopilot',
+			'autopilot.pauseBoard': 'Paused — the board is paused.',
+			'autopilot.pauseMember': 'Paused — every team member is paused.',
+			'autopilot.membersPaused': 'Some members are paused; their tickets are skipped.',
+			'autopilot.offNote': 'Autopilot is off — running sessions continue and nothing is cancelled.',
+			'autopilot.unavailableTitle': 'Autopilot unavailable',
+			'autopilot.unavailableBody': 'This host build does not expose the autopilot service yet, so the board keeps working manually.',
+			'autopilot.phase1Title': 'Phase 1 runs one implementer at a time',
+			'autopilot.phase1Body':
+				'Autopilot starts at most one implementer session at a time, and one session per refine and review lane. Two agents would otherwise edit the same board and worktree in parallel and overwrite each other. Raise a lane cap only when you accept that risk.',
+			'autopilot.phase1Dismiss': 'Got it',
+			'autopilot.settings': 'Settings',
+			'autopilot.cadence': 'Cadence',
+			'autopilot.minutes': '{n} min',
+			'autopilot.maxReadyDepth': 'Max Ready depth',
+			'autopilot.laneCaps': 'Lane caps',
+			'autopilot.lane.refine': 'Refine',
+			'autopilot.lane.implement': 'Implement',
+			'autopilot.lane.review': 'Review',
+			'autopilot.budget': 'Dispatch budget',
+			'autopilot.budgetHour': 'Hour: {remaining} of {limit} left',
+			'autopilot.budgetDay': 'Day: {remaining} of {limit} left',
+			'autopilot.budgetUnavailable': 'Dispatch budget unavailable',
+			'autopilot.preview': 'Preview next pulse',
+			'autopilot.previewBusy': 'Previewing…',
+			'autopilot.previewTitle': 'Next pulse plan',
+			'autopilot.previewSummary': '{dispatches} dispatch · {skips} skip',
+			'autopilot.previewEmptyTitle': 'Nothing to do right now',
+			'autopilot.previewEmptyBody': 'The planner will not start anything. Summary: {summary}',
+			'autopilot.reasonCount': '{label} ×{count}',
+			'autopilot.reasonUnknown': 'Unknown reason ({code})',
+			'autopilot.boardLevel': 'Board',
+			'autopilot.noMember': 'No member',
+			'autopilot.pulseNow': 'Pulse now',
+			'autopilot.pulseBusy': 'Running pulse…',
+			'autopilot.pulseDisabled': 'Pulse now is disabled while autopilot is paused.',
+			'autopilot.pulseDone': 'Pulse {id} finished.',
+			'autopilot.error': 'Autopilot error ({code})',
+			'autopilot.errorPulsing': 'A pulse is already running for this project. Try again when it finishes.',
+			'autopilot.errorBudget': 'The dispatch budget is exhausted. Try again when the window resets.',
+			'autopilot.errorInvalid': 'The host rejected this setting; the previous value was restored.',
+			'autopilot.dismissError': 'Dismiss error',
+			'autopilot.saving': 'Saving…',
+			'autopilot.reason.admitted': 'Admitted — starts a session',
+			'autopilot.reason.disabled': 'Autopilot is disabled',
+			'autopilot.reason.board-paused': 'The board is paused',
+			'autopilot.reason.epic': 'EPICs are never dispatched',
+			'autopilot.reason.blocked': 'The ticket is blocked',
+			'autopilot.reason.active-execution': 'A session is already running',
+			'autopilot.reason.lane-cap': 'The lane is at its concurrency cap',
+			'autopilot.reason.wip-limit': 'In Progress is at its WIP limit',
+			'autopilot.reason.ready-depth': 'Ready is at its depth ceiling',
+			'autopilot.reason.no-member': 'No member has an eligible role',
+			'autopilot.reason.member-busy': 'Every eligible member is busy',
+			'autopilot.reason.member-paused': 'The member is paused',
+			'autopilot.reason.stale-execution': 'The execution is stale',
+			'autopilot.reason.postcondition-failed': 'The last dispatch missed its target; backing off',
+			'autopilot.reason.budget-exhausted': 'The dispatch budget is exhausted',
+			'autopilot.reason.loop-guard': 'Too many failures; parked for a human',
+			'autopilot.reason.pulse-cap': 'This pulse already used its dispatch slots',
+			'autopilot.reason.no-work': 'No candidate work in this lane',
+			// Pulse-level failure family (a dispatch that threw): the planner row is
+			// still `admitted`, so the alert names the failure instead of only the raw
+			// host message. Never rendered as a bare code (AC 8).
+			'autopilot.reason.dispatch-failed': 'Dispatch failed — the session did not start',
+			// KB-77 observability: pulse feed, next-tick countdown, lane admission,
+			// member autopilot state and deduplicated alerts.
+			'autopilot.countdown.label': 'Next pulse',
+			'autopilot.countdown.value': '{mm}:{ss}',
+			'autopilot.countdown.off': 'off',
+			'autopilot.countdown.paused': 'paused',
+			'autopilot.countdown.aria': 'Next autopilot pulse: {value}',
+			'autopilot.trigger.timer': 'Timer',
+			'autopilot.trigger.manual': 'Manual',
+			'autopilot.trigger.resume': 'Resume',
+			'autopilot.feedTitle': 'Pulse feed',
+			'autopilot.feedCount': 'newest {n}',
+			'autopilot.feedLoading': 'Loading pulses…',
+			'autopilot.feedUnavailable': 'Pulse history is unavailable on this host.',
+			'autopilot.feedEmptyTitle': 'No pulses yet — turn Autopilot on',
+			'autopilot.feedEmptyBody': 'Every pulse records what it considered and what it started.',
+			'autopilot.feedEmptyAction': 'Turn Autopilot on',
+			// Same empty feed while autopilot is already on: the toggle is hidden, so
+			// the copy must not ask the operator to turn on something that is on.
+			'autopilot.feedEmptyTitleOn': 'No pulses yet',
+			'autopilot.feedEmptyBodyOn': 'Autopilot is on — the first pulse appears on the next timer tick.',
+			'autopilot.feedOpen': 'Pulse {id} — show decisions',
+			'autopilot.feedDetails': 'Pulse {id} decisions',
+			'autopilot.feedDecisionTitle': 'Decisions',
+			'autopilot.feedDispatchedTitle': 'Sessions started',
+			'autopilot.feedNoDecisions': 'This pulse recorded no decisions.',
+			'autopilot.feedNoDispatched': 'No session was started.',
+			'autopilot.feedDispatchSkipped': 'Admitted in the plan, skipped at dispatch — no session started.',
+			'autopilot.feedDurationUnknown': '—',
+			'autopilot.durationSeconds': '{value}s',
+			'autopilot.durationMs': '{value} ms',
+			'autopilot.feedErrorMarker': 'error',
+			'autopilot.feedDispatched': '{n} dispatched',
+			'autopilot.feedSkipped': '{n} skipped',
+			'autopilot.action.dispatch': 'Dispatch',
+			'autopilot.action.skip': 'Skip',
+			'autopilot.alert.group': 'Autopilot alerts',
+			'autopilot.alert.title': 'Autopilot alert',
+			'autopilot.alert.pulseError': 'Pulse failed: {message}',
+			'autopilot.alert.openTicket': 'Open ticket {id}',
+			'autopilot.alert.ack': 'Acknowledge',
+			'autopilot.entryAlerts': '{n} unread alerts',
+			'autopilot.laneAdmission.busy': 'busy',
+			'autopilot.laneAdmission.idle': 'idle',
+			'autopilot.laneAdmission.paused': 'paused',
+			'autopilot.laneAdmission.capacity': '({occupancy}/{cap})',
+			'autopilot.laneAdmission.aria': '{lane} lane admission: {state} {occupancy} of {cap} slots',
+			'autopilot.member.chip': 'Autopilot: {state}',
+			'autopilot.member.active': 'Active on {id}',
+			'autopilot.member.activeSession': 'Session running',
+			'autopilot.member.next': 'Next {id}',
+			'autopilot.member.resume': 'Resume {id}',
+			'autopilot.member.idle': 'Session idle',
+			'autopilot.member.paused': 'Paused',
+			'autopilot.member.noWork': 'No work',
+			'autopilot.member.lastActive': 'Last activation {ago}',
+			'autopilot.member.neverActive': 'Never activated',
+			'autopilot.member.aria': 'Autopilot: {state}; {time}',
 
 			'project.select': 'Select project',
 			'project.none': 'No projects yet',
@@ -286,6 +1505,12 @@ window.__ModuleLoader__.load({
 			'card.checklist': 'Checklist {done}/{total}',
 			'card.comments': '{n} comments',
 			'card.updated': 'Updated {ago}',
+			// KB-3 EPIC model: badge, parent chip and the Backlog-only reason.
+			'card.parent': 'Parent {id}',
+			'card.parentTitle': 'EPIC: {title}',
+			'card.children': '{n} children',
+			'card.epicLocked': 'Backlog only',
+			'card.epicLockedHint': 'An EPIC stays in Backlog and cannot be dragged, moved or run by an agent.',
 
 			'filters.title': 'Filters',
 			'filters.role': 'Role',
@@ -315,6 +1540,12 @@ window.__ModuleLoader__.load({
 			'detail.titlePlaceholder': 'Ticket title',
 			'detail.description': 'Description',
 			'detail.descriptionPlaceholder': 'Add context, acceptance criteria…',
+			// KB-58 read/Edit/Preview toggle for the description and EPIC PRD.
+			'detail.descriptionMode': 'Description view',
+			'detail.edit': 'Edit',
+			'detail.preview': 'Preview',
+			'detail.descriptionEmpty': 'No description yet — use Edit to add context, acceptance criteria, and links.',
+			'detail.epicPrdEmpty': 'No EPIC PRD yet — use Edit to write the outcome, scope, acceptance criteria, and decomposition plan.',
 			'detail.column': 'Column',
 			'detail.role': 'Role',
 			'detail.roleNone': 'No role',
@@ -344,6 +1575,14 @@ window.__ModuleLoader__.load({
 			'detail.deleteHint': 'Deleting removes this ticket and its history.',
 			'detail.close': 'Close ticket',
 			'detail.moveHint': 'Kanban moves one column at a time.',
+			// KB-3 EPIC drawer: PRD area + children list.
+			'detail.epicPrd': 'EPIC PRD',
+			'detail.epicPrdHint': 'Outcome, scope, acceptance criteria, and the decomposition plan for this EPIC.',
+			'detail.children': 'Children',
+			'detail.childrenEmpty': 'No child tickets yet.',
+			'detail.childrenEmptyHint': 'Create a ticket with this EPIC as its parent to decompose it.',
+			'detail.epicLocked': 'EPICs stay in Backlog. Decompose it into child tickets instead of moving or running it.',
+			'detail.childStatus': 'Status',
 			'detail.source': 'Source',
 
 			'new.title': 'New ticket',
@@ -357,6 +1596,7 @@ window.__ModuleLoader__.load({
 			'new.titleRequired': 'Enter a title to create the ticket',
 			'new.create': 'Create ticket',
 			'new.creating': 'Creating…',
+			'new.epicHint': 'EPICs are created in Backlog and cannot be claimed by agents.',
 
 			// Thought intake (KB-1). Shared labels reuse existing keys
 			// (actions.cancel, execution.openSession, header.close).
@@ -366,16 +1606,65 @@ window.__ModuleLoader__.load({
 			'thought.send': 'Send thought',
 			'thought.sending': 'Sending…',
 			'thought.success': 'Thought recorded — a product manager is on it.',
-			'thought.pausedHint': 'Resume the board to capture a thought',
+			// KB-5: capturing while paused queues the thought instead of refusing it.
+			'thought.pausedHint': 'Captures are queued while the board is paused',
 			'thought.close': 'Close thoughts',
 			'thought.empty': 'No thoughts yet. Press Speak a thought to capture one.',
 			'thought.count': '{n} thoughts',
+			'thought.queuedCount': '{n} queued',
 			'thought.expand': 'Expand',
 			'thought.collapse': 'Collapse',
 			'thought.status.recorded': 'Recorded',
 			'thought.status.working': 'Thinking…',
 			'thought.status.done': 'Done',
 			'thought.status.failed': 'Failed',
+			'thought.status.queued': 'Queued',
+			'thought.status.cancelled': 'Cancelled',
+			'thought.status.unknown': 'Unknown status',
+			'thought.timeline': 'History',
+			'thought.retry': 'Retry',
+			'thought.cancel': 'Cancel run',
+			'thought.retryOf': 'Retry of {id}',
+			'thought.retryOfPlain': 'Retry of {id} (not in the current window)',
+			'thought.retriedToast': 'Thought retried as {id}.',
+			'thought.cancelledToast': 'Thought cancelled.',
+			'thought.ticketCreated': 'Created {id}',
+			'thought.edited': 'Edited',
+			'thought.deleted': 'Deleted',
+			'thought.delete': 'Delete',
+			'thought.edit': 'Edit',
+			'thought.save': 'Save',
+			'thought.cancelEdit': 'Cancel edit',
+			'thought.editedToast': 'Thought updated.',
+			'thought.deletedToast': 'Thought deleted.',
+			'thought.editPlaceholder': 'Edit the thought text',
+			'thought.emptyError': 'Type a thought before saving it.',
+			'thought.queuedHint': 'Queued — it runs when the board resumes',
+			'thought.ticketChip': 'Thought',
+			'thought.deletedFallback': 'Thought deleted',
+			'thought.unavailable': 'Thought not loaded',
+
+			// Voice dictation (KB-2). The installed voice bundle owns
+			// recognition; the dialog owns capture and one-stop transcription.
+			'thought.voice.start': 'Start dictation',
+			'thought.voice.stop': 'Stop dictation and transcribe',
+			'thought.voice.checking': 'Checking voice input…',
+			'thought.voice.requesting': 'Waiting for microphone…',
+			'thought.voice.listening': 'Listening… {seconds}s',
+			'thought.voice.transcribing': 'Transcribing…',
+			'thought.voice.unavailable': 'Voice input is unavailable — enable the Voice Input bundle in Plugins.',
+			'thought.voice.unready': 'Voice input is not ready — prepare the model in Plugins → Voice Input.',
+			'thought.voice.errorPermission': 'Microphone access is denied. Type your thought, or allow the microphone in your browser.',
+			'thought.voice.errorDevice': 'No microphone is available. Type your thought instead.',
+			'thought.voice.errorCapture': 'Recording failed. Your text is safe — try dictation again or type.',
+			'thought.voice.errorTranscribe': 'Could not transcribe this recording. Your text is safe — try again or type.',
+			'thought.voice.errorEmpty': 'No speech recognized — try again or type.',
+			'thought.voice.errorTooLong': 'That recording is too long. Keep each dictation under {seconds}s.',
+			'thought.voice.announceChecking': 'Checking voice input',
+			'thought.voice.announceRequesting': 'Waiting for microphone',
+			'thought.voice.announceListening': 'Listening. Press the microphone to stop and transcribe.',
+			'thought.voice.announceTranscribing': 'Transcribing',
+			'thought.voice.announceAdded': 'Transcript added: {text}',
 
 			'scan.title': 'Project scan',
 			'scan.subtitle': 'Scanned {ago}',
@@ -408,17 +1697,16 @@ window.__ModuleLoader__.load({
 			'team.resumeBoard': 'Resume board',
 			'team.agents': '{n} agents',
 			'team.running': '{n} running',
-			'team.activeTickets': '{n} active',
+			'team.activeTickets': '{n} active tickets',
 			'team.close': 'Hide team',
 			'team.openTicket': 'Open {id}',
 			'team.members': '{n} members',
-			'team.working': '{n} working',
+			'team.running': '{n} running',
+			'team.idle': '{n} idle',
 			'team.roster': 'Members',
 			'team.rosterEmpty': 'No members yet. Add one manually, or describe a teammate and let the AI draft it.',
 			'team.addMember': 'Add member',
 			'team.addWithAi': 'Add with AI',
-			'team.otherAgents': 'Other agents',
-			'team.otherAgentsEmpty': 'No session agents outside the roster',
 			'team.rolePlaybooks': 'Role playbooks',
 			'team.since': 'Working {ago}',
 			'team.lastActive': 'Active {ago}',
@@ -517,6 +1805,8 @@ window.__ModuleLoader__.load({
 			'types.task': 'Task',
 			'types.bug': 'Bug',
 			'types.spike': 'Spike',
+			// KB-3 EPIC badge: structural parent ticket, not one more work item.
+			'types.epic': 'EPIC',
 
 			'priority.low': 'Low',
 			'priority.medium': 'Medium',
@@ -593,6 +1883,10 @@ window.__ModuleLoader__.load({
 			'time.hours': '{n}h ago',
 			'time.days': '{n}d ago',
 			'time.weeks': '{n}w ago',
+
+			'md.codeBlock': 'Code block',
+			'md.table': 'Table',
+			'md.linkExternal': 'opens in a new tab',
 		}
 
 		const zh = {
@@ -613,6 +1907,132 @@ window.__ModuleLoader__.load({
 			'header.close': '关闭',
 			'header.speakThought': '说出想法',
 			'header.thoughts': '想法',
+
+			// KB-76 自动巡航控件：入口、设置弹层、试运行预览、立即脉冲、暂停/关闭/不可用状态与内联错误。
+			'autopilot.entry': '自动巡航',
+			'autopilot.entryState': '自动巡航 — {state}',
+			'autopilot.title': '自动巡航控制',
+			'autopilot.state.on': '已开启',
+			'autopilot.state.off': '已关闭',
+			'autopilot.state.paused': '已暂停',
+			'autopilot.state.unavailable': '不可用',
+			'autopilot.toggleLabel': '自动巡航',
+			'autopilot.pauseBoard': '已暂停 — 看板处于暂停状态。',
+			'autopilot.pauseMember': '已暂停 — 所有团队成员均已暂停。',
+			'autopilot.membersPaused': '部分成员已暂停，其任务会被跳过。',
+			'autopilot.offNote': '自动巡航已关闭 — 正在运行的会话会继续，不会被取消。',
+			'autopilot.unavailableTitle': '自动巡航不可用',
+			'autopilot.unavailableBody': '此宿主版本尚未提供自动巡航服务，看板仍可手动操作。',
+			'autopilot.phase1Title': '第一阶段一次只运行一个实现者',
+			'autopilot.phase1Body':
+				'自动巡航一次最多启动一个实现者会话，精炼与评审泳道也各为单会话。否则两个代理会并行修改同一看板与工作区并互相覆盖。只有在你接受该风险时才提高泳道上限。',
+			'autopilot.phase1Dismiss': '知道了',
+			'autopilot.settings': '设置',
+			'autopilot.cadence': '节奏',
+			'autopilot.minutes': '{n} 分钟',
+			'autopilot.maxReadyDepth': 'Ready 最大深度',
+			'autopilot.laneCaps': '泳道并发上限',
+			'autopilot.lane.refine': '精炼',
+			'autopilot.lane.implement': '实现',
+			'autopilot.lane.review': '评审',
+			'autopilot.budget': '派发预算',
+			'autopilot.budgetHour': '小时：剩余 {remaining}/{limit}',
+			'autopilot.budgetDay': '天：剩余 {remaining}/{limit}',
+			'autopilot.budgetUnavailable': '派发预算读数不可用',
+			'autopilot.preview': '预览下一次脉冲',
+			'autopilot.previewBusy': '正在预览…',
+			'autopilot.previewTitle': '下一次脉冲计划',
+			'autopilot.previewSummary': '{dispatches} 个派发 · {skips} 个跳过',
+			'autopilot.previewEmptyTitle': '当前没有可执行的工作',
+			'autopilot.previewEmptyBody': '计划器不会启动任何任务。原因汇总：{summary}',
+			'autopilot.reasonCount': '{label} ×{count}',
+			'autopilot.reasonUnknown': '未知原因（{code}）',
+			'autopilot.boardLevel': '看板',
+			'autopilot.noMember': '无成员',
+			'autopilot.pulseNow': '立即脉冲',
+			'autopilot.pulseBusy': '正在执行脉冲…',
+			'autopilot.pulseDisabled': '自动巡航暂停期间无法立即执行脉冲。',
+			'autopilot.pulseDone': '脉冲 {id} 已完成。',
+			'autopilot.error': '自动巡航错误（{code}）',
+			'autopilot.errorPulsing': '该项目已有脉冲正在运行，请在其结束后重试。',
+			'autopilot.errorBudget': '派发预算已用尽，请在窗口重置后重试。',
+			'autopilot.errorInvalid': '宿主拒绝了该设置，已恢复之前的值。',
+			'autopilot.dismissError': '关闭错误',
+			'autopilot.saving': '正在保存…',
+			'autopilot.reason.admitted': '已准入 — 将启动会话',
+			'autopilot.reason.disabled': '自动巡航已关闭',
+			'autopilot.reason.board-paused': '看板已暂停',
+			'autopilot.reason.epic': 'EPIC 不会被派发',
+			'autopilot.reason.blocked': '任务被阻塞',
+			'autopilot.reason.active-execution': '已有运行中的会话',
+			'autopilot.reason.lane-cap': '泳道已达到并发上限',
+			'autopilot.reason.wip-limit': '进行中已达到 WIP 上限',
+			'autopilot.reason.ready-depth': 'Ready 深度已达到上限',
+			'autopilot.reason.no-member': '没有合适角色的成员',
+			'autopilot.reason.member-busy': '成员正忙',
+			'autopilot.reason.member-paused': '成员已暂停',
+			'autopilot.reason.stale-execution': '执行已停滞',
+			'autopilot.reason.postcondition-failed': '上次派发未达成目标，正在退避',
+			'autopilot.reason.budget-exhausted': '派发预算已用尽',
+			'autopilot.reason.loop-guard': '失败次数过多，已停下等待人工处理',
+			'autopilot.reason.pulse-cap': '本次脉冲名额已满',
+			'autopilot.reason.no-work': '该泳道当前没有可执行的工作',
+			'autopilot.reason.dispatch-failed': '派发失败 — 会话未能启动',
+			// KB-77 观测面：脉冲记录、下一次脉冲倒计时、泳道准入、成员自动巡航状态与去重告警。
+			'autopilot.countdown.label': '下一次脉冲',
+			'autopilot.countdown.value': '{mm}:{ss}',
+			'autopilot.countdown.off': '关闭',
+			'autopilot.countdown.paused': '暂停',
+			'autopilot.countdown.aria': '下一次自动巡航脉冲：{value}',
+			'autopilot.trigger.timer': '定时',
+			'autopilot.trigger.manual': '手动',
+			'autopilot.trigger.resume': '恢复后',
+			'autopilot.feedTitle': '脉冲记录',
+			'autopilot.feedCount': '最新 {n} 条',
+			'autopilot.feedLoading': '正在加载脉冲…',
+			'autopilot.feedUnavailable': '此宿主不提供脉冲历史。',
+			'autopilot.feedEmptyTitle': '暂无脉冲 — 请开启自动巡航',
+			'autopilot.feedEmptyBody': '每次脉冲都会记录其考量与启动内容。',
+			'autopilot.feedEmptyAction': '开启自动巡航',
+			'autopilot.feedEmptyTitleOn': '暂无脉冲',
+			'autopilot.feedEmptyBodyOn': '自动巡航已开启 — 首次脉冲会在下一个定时周期出现。',
+			'autopilot.feedOpen': '脉冲 {id} — 展开决策',
+			'autopilot.feedDetails': '脉冲 {id} 的决策',
+			'autopilot.feedDecisionTitle': '决策',
+			'autopilot.feedDispatchedTitle': '已启动的会话',
+			'autopilot.feedNoDecisions': '该脉冲没有记录任何决策。',
+			'autopilot.feedNoDispatched': '没有启动任何会话。',
+			'autopilot.feedDispatchSkipped': '计划中已准入，但派发时被跳过 — 未启动会话。',
+			'autopilot.feedDurationUnknown': '—',
+			'autopilot.durationSeconds': '{value} 秒',
+			'autopilot.durationMs': '{value} 毫秒',
+			'autopilot.feedErrorMarker': '错误',
+			'autopilot.feedDispatched': '派发 {n}',
+			'autopilot.feedSkipped': '跳过 {n}',
+			'autopilot.action.dispatch': '派发',
+			'autopilot.action.skip': '跳过',
+			'autopilot.alert.group': '自动巡航告警',
+			'autopilot.alert.title': '自动巡航告警',
+			'autopilot.alert.pulseError': '脉冲失败：{message}',
+			'autopilot.alert.openTicket': '打开任务 {id}',
+			'autopilot.alert.ack': '确认',
+			'autopilot.entryAlerts': '{n} 条未读告警',
+			'autopilot.laneAdmission.busy': '繁忙',
+			'autopilot.laneAdmission.idle': '空闲',
+			'autopilot.laneAdmission.paused': '暂停',
+			'autopilot.laneAdmission.capacity': '（{occupancy}/{cap}）',
+			'autopilot.laneAdmission.aria': '{lane}泳道准入：{state}，{occupancy}/{cap} 个名额',
+			'autopilot.member.chip': '自动巡航：{state}',
+			'autopilot.member.active': '正在处理 {id}',
+			'autopilot.member.activeSession': '会话运行中',
+			'autopilot.member.next': '下一个 {id}',
+			'autopilot.member.resume': '继续 {id}',
+			'autopilot.member.idle': '会话空闲',
+			'autopilot.member.paused': '已暂停',
+			'autopilot.member.noWork': '无工作',
+			'autopilot.member.lastActive': '最近激活 {ago}',
+			'autopilot.member.neverActive': '从未激活',
+			'autopilot.member.aria': '自动巡航：{state}；{time}',
 
 			'project.select': '选择项目',
 			'project.none': '暂无项目',
@@ -698,6 +2118,11 @@ window.__ModuleLoader__.load({
 			'card.checklist': '清单 {done}/{total}',
 			'card.comments': '{n} 条评论',
 			'card.updated': '{ago}更新',
+			'card.parent': '父任务 {id}',
+			'card.parentTitle': '史诗：{title}',
+			'card.children': '{n} 个子任务',
+			'card.epicLocked': '仅 Backlog',
+			'card.epicLockedHint': '史诗固定留在 Backlog，不能拖拽、移动或由智能体运行。',
 
 			'filters.title': '筛选',
 			'filters.role': '角色',
@@ -727,6 +2152,12 @@ window.__ModuleLoader__.load({
 			'detail.titlePlaceholder': '任务标题',
 			'detail.description': '描述',
 			'detail.descriptionPlaceholder': '补充背景、验收标准…',
+			// KB-58 描述与史诗 PRD 的阅读 / 编辑 / 预览切换。
+			'detail.descriptionMode': '描述视图',
+			'detail.edit': '编辑',
+			'detail.preview': '预览',
+			'detail.descriptionEmpty': '暂无描述 — 使用“编辑”添加背景、验收标准与链接。',
+			'detail.epicPrdEmpty': '暂无史诗 PRD — 使用“编辑”撰写成果、范围、验收标准与拆解计划。',
 			'detail.column': '列',
 			'detail.role': '角色',
 			'detail.roleNone': '无角色',
@@ -756,6 +2187,13 @@ window.__ModuleLoader__.load({
 			'detail.deleteHint': '删除后将移除该任务及其历史记录。',
 			'detail.close': '关闭任务详情',
 			'detail.moveHint': '看板每次只能移动一列。',
+			'detail.epicPrd': '史诗 PRD',
+			'detail.epicPrdHint': '史诗的成果、范围、验收标准与拆解计划。',
+			'detail.children': '子任务',
+			'detail.childrenEmpty': '暂无子任务。',
+			'detail.childrenEmptyHint': '新建任务并把该史诗设为父任务，即可开始拆解。',
+			'detail.epicLocked': '史诗固定留在 Backlog。请把它拆解为子任务，而不是移动或运行它。',
+			'detail.childStatus': '状态',
 			'detail.source': '来源',
 
 			'new.title': '新建任务',
@@ -769,6 +2207,7 @@ window.__ModuleLoader__.load({
 			'new.titleRequired': '请输入标题以创建任务',
 			'new.create': '创建任务',
 			'new.creating': '创建中…',
+			'new.epicHint': '史诗创建在 Backlog，且不能由智能体认领。',
 
 			// 想法记录（KB-1）。共用文案复用现有键（actions.cancel、execution.openSession、header.close）。
 			'thought.title': '说出想法',
@@ -777,16 +2216,64 @@ window.__ModuleLoader__.load({
 			'thought.send': '发送想法',
 			'thought.sending': '发送中…',
 			'thought.success': '已记录想法，产品经理正在处理。',
-			'thought.pausedHint': '恢复看板后才能记录想法',
+			// KB-5：暂停期间记录的想法会排队，而不是被拒绝。
+			'thought.pausedHint': '看板暂停期间记录的想法会排队',
 			'thought.close': '关闭想法',
 			'thought.empty': '还没有想法。点击“说出想法”记录一个。',
 			'thought.count': '{n} 个想法',
+			'thought.queuedCount': '{n} 个排队中',
 			'thought.expand': '展开',
 			'thought.collapse': '收起',
 			'thought.status.recorded': '已记录',
 			'thought.status.working': '思考中…',
 			'thought.status.done': '已完成',
 			'thought.status.failed': '失败',
+			'thought.status.queued': '已排队',
+			'thought.status.cancelled': '已取消',
+			'thought.status.unknown': '未知状态',
+			'thought.timeline': '历史',
+			'thought.retry': '重试',
+			'thought.cancel': '取消运行',
+			'thought.retryOf': '重试自 {id}',
+			'thought.retryOfPlain': '重试自 {id}（不在当前窗口）',
+			'thought.retriedToast': '已重试为 {id}。',
+			'thought.cancelledToast': '已取消该想法。',
+			'thought.ticketCreated': '已创建 {id}',
+			'thought.edited': '已编辑',
+			'thought.deleted': '已删除',
+			'thought.delete': '删除',
+			'thought.edit': '编辑',
+			'thought.save': '保存',
+			'thought.cancelEdit': '取消编辑',
+			'thought.editedToast': '想法已更新。',
+			'thought.deletedToast': '想法已删除。',
+			'thought.editPlaceholder': '修改想法内容',
+			'thought.emptyError': '请先输入想法再保存。',
+			'thought.queuedHint': '已排队，恢复看板后开始处理',
+			'thought.ticketChip': '想法',
+			'thought.deletedFallback': '想法已删除',
+			'thought.unavailable': '想法未加载',
+
+			// 语音输入（KB-2）。识别由已安装的语音包负责；对话框负责录音与停止后的一次转写。
+			'thought.voice.start': '开始语音输入',
+			'thought.voice.stop': '停止语音输入并转写',
+			'thought.voice.checking': '正在检查语音输入…',
+			'thought.voice.requesting': '正在等待麦克风…',
+			'thought.voice.listening': '正在聆听… {seconds} 秒',
+			'thought.voice.transcribing': '正在转写…',
+			'thought.voice.unavailable': '语音输入不可用——请在“插件”中启用 Voice Input。',
+			'thought.voice.unready': '语音输入尚未就绪——请在“插件”→“Voice Input”中准备模型。',
+			'thought.voice.errorPermission': '麦克风权限被拒绝。请直接输入想法，或在浏览器中允许麦克风。',
+			'thought.voice.errorDevice': '没有可用的麦克风，请直接输入想法。',
+			'thought.voice.errorCapture': '录音失败。文本已保留——请重试语音输入或直接输入。',
+			'thought.voice.errorTranscribe': '无法转写这段录音。文本已保留——请重试或直接输入。',
+			'thought.voice.errorEmpty': '未识别到语音——请重试或直接输入。',
+			'thought.voice.errorTooLong': '录音过长。每次语音输入请保持在 {seconds} 秒以内。',
+			'thought.voice.announceChecking': '正在检查语音输入',
+			'thought.voice.announceRequesting': '正在等待麦克风',
+			'thought.voice.announceListening': '正在聆听。点击麦克风停止并转写。',
+			'thought.voice.announceTranscribing': '正在转写',
+			'thought.voice.announceAdded': '已添加转写文本：{text}',
 
 			'scan.title': '项目扫描',
 			'scan.subtitle': '{ago}扫描',
@@ -819,17 +2306,15 @@ window.__ModuleLoader__.load({
 			'team.resumeBoard': '恢复看板',
 			'team.agents': '{n} 个代理',
 			'team.running': '{n} 个运行中',
-			'team.activeTickets': '{n} 项进行中',
+			'team.activeTickets': '{n} 项进行中任务',
 			'team.close': '隐藏团队',
 			'team.openTicket': '打开 {id}',
 			'team.members': '{n} 位成员',
-			'team.working': '{n} 位工作中',
+			'team.idle': '{n} 位空闲',
 			'team.roster': '成员',
 			'team.rosterEmpty': '还没有成员。可以手动添加，或描述一位伙伴让 AI 起草。',
 			'team.addMember': '添加成员',
 			'team.addWithAi': 'AI 添加',
-			'team.otherAgents': '其他代理',
-			'team.otherAgentsEmpty': '名册之外暂无会话代理',
 			'team.rolePlaybooks': '角色手册',
 			'team.since': '已工作 {ago}',
 			'team.lastActive': '{ago}活跃',
@@ -928,6 +2413,7 @@ window.__ModuleLoader__.load({
 			'types.task': '任务',
 			'types.bug': '缺陷',
 			'types.spike': '探索',
+			'types.epic': '史诗',
 
 			'priority.low': '低',
 			'priority.medium': '中',
@@ -1002,6 +2488,10 @@ window.__ModuleLoader__.load({
 			'time.hours': '{n} 小时前',
 			'time.days': '{n} 天前',
 			'time.weeks': '{n} 周前',
+
+			'md.codeBlock': '代码块',
+			'md.table': '表格',
+			'md.linkExternal': '在新标签页打开',
 		}
 
 		// ------------------------------------------------------------------
@@ -1127,6 +2617,17 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-chip--error{color:var(--dsw-alias-state-error-primary);border-color:currentColor}
 .kb-chip--success{color:var(--dsw-alias-state-success-primary);border-color:currentColor}
 .kb-chip--idle{color:var(--dsw-alias-state-idle-primary);border-color:currentColor}
+.kb-chip--epic{color:var(--dsw-alias-brand-primary);border-color:currentColor;letter-spacing:.04em}
+.kb-chip--parent{appearance:none;font:inherit;padding:0 6px;color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l2);cursor:pointer}
+.kb-chip--parent:hover{color:var(--dsw-alias-label-primary);border-color:currentColor}
+.kb-card--epic{box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary)}
+.kb-childList{display:flex;flex-direction:column;gap:6px}
+.kb-childRow{display:flex;align-items:center;gap:8px;width:100%;padding:7px 9px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:inherit;font:inherit;text-align:left;cursor:pointer}
+.kb-childRow:hover{border-color:var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3)}
+.kb-childRow:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.kb-childId{font-size:11px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-childTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.kb-hint--epic{color:var(--dsw-alias-brand-primary)}
 .kb-iconMeta{display:inline-flex;align-items:center;gap:2px;min-width:0;font-size:10px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);white-space:nowrap}
 .kb-cardMeta .kb-iconMeta{max-width:100%;flex:0 1 auto}
 .kb-cardOwnerName{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1183,6 +2684,16 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-description{width:100%;min-height:64px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:1.5;padding:6px;outline:none;resize:vertical}
 .kb-description:hover{border-color:var(--dsw-alias-border-l1)}
 .kb-description:focus{border-color:var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1)}
+/* KB-58 description read/Edit/Preview: the header row carries the EPIC label and the
+   mode toggle; the read view is plain (no border) and the dependency's .kb-md
+   typography is contained inside the drawer body. */
+.kb-descHead{display:flex;align-items:center;gap:6px;min-width:0}
+.kb-descModes{display:flex;align-items:center;gap:4px;margin-left:auto;flex:none}
+.kb-btn.kb-descMode[aria-pressed="true"]{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 10%,var(--dsw-alias-bg-layer-1))}
+.kb-descMode:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.kb-descRead{min-width:0;padding:0 6px}
+.kb-descRead .kb-md{min-width:0;max-width:100%}
+.kb-descEmpty{padding:0 6px}
 .kb-savedHint{display:inline-flex;align-items:center;gap:3px;font-size:10px;color:var(--dsw-alias-state-success-primary);flex:none}
 .kb-field{display:flex;flex-direction:column;gap:4px;min-width:0}
 .kb-fieldLabel{font-size:10px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
@@ -1229,7 +2740,10 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-dialogFoot{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l1);flex:none}
 .kb-formGrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .kb-formGrid .kb-select{width:100%}
-.kb-vision{max-height:140px;overflow-y:auto;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);font-size:12px;line-height:1.55;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
+.kb-vision{max-height:140px;overflow-y:auto;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);font-size:12px;line-height:1.55;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-vision:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+/* KB-61: the vision keeps its subdued body colour inside the shared .kb-md surface. */
+.kb-vision .kb-md{color:var(--dsw-alias-label-secondary)}
 .kb-docRow{display:flex;flex-direction:column;gap:1px;padding:5px 0;border-bottom:1px solid var(--dsw-alias-border-l1)}
 .kb-docRow:last-child{border-bottom:0}
 .kb-docTitle{font-size:12px;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
@@ -1243,8 +2757,16 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-convSub{font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap;flex:none}
 .kb-candidate{display:flex;align-items:flex-start;gap:8px;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
 .kb-candidateMain{display:flex;flex-direction:column;gap:3px;flex:1;min-width:0}
-.kb-candidateTitle{font-size:12px;font-weight:500;line-height:1.4;overflow-wrap:anywhere}
-.kb-candidateDesc{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.kb-candidateTitle{display:block;font-size:12px;font-weight:500;line-height:1.4;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-candidateDesc{display:block;font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary);max-height:calc(3 * 1.4 * 11px);overflow:hidden;overflow-wrap:anywhere}
+/* KB-61: candidate descriptions are Markdown, so the clamp lives on the wrapper
+   (a block, exactly 3 line-heights tall). Paragraph/list margins are zeroed so
+   the clamp lands on a line boundary instead of cutting through glyphs. */
+.kb-candidateDesc .kb-md{font-size:11px;line-height:1.4;color:inherit}
+.kb-candidateDesc .kb-md p{margin:0}
+.kb-candidateDesc .kb-md ul,.kb-candidateDesc .kb-md ol{margin:0;padding-left:16px}
+.kb-candidateDesc .kb-md li{margin:0}
+.kb-candidateDesc .kb-md h3,.kb-candidateDesc .kb-md h4,.kb-candidateDesc .kb-md h5,.kb-candidateDesc .kb-md h6{margin:0;font-size:11px;line-height:1.4}
 .kb-candidateMeta{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
 .kb-scanCandidateList{display:flex;flex-direction:column;gap:6px}
 .kb-center{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;flex:1;min-height:0;padding:32px;text-align:center;overflow-y:auto}
@@ -1349,11 +2871,15 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-thoughtStatus--done{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
 .kb-thoughtStatus--failed{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
 .kb-thoughtStatus--recorded{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l2)}
+.kb-thoughtStatus--queued{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
+.kb-thoughtStatus--cancelled{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l2);text-decoration:line-through}
+.kb-thoughtsHeadCount--queued{color:var(--dsw-alias-state-warn-primary)}
 .kb-thoughtAge{margin-left:auto;font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap;flex:none;font-variant-numeric:tabular-nums}
 .kb-thoughtText{font-size:12.5px;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.kb-thoughtText--expanded{display:block;-webkit-line-clamp:unset;overflow:visible}
+.kb-thoughtText--expanded{display:block;white-space:normal;-webkit-line-clamp:unset;overflow:visible}
 .kb-thoughtExpand{align-self:flex-start;padding:0;border:0;background:transparent;color:var(--dsw-alias-brand-primary);font-size:11px;cursor:pointer}
 .kb-thoughtExpand:hover{text-decoration:underline}
+.kb-thoughtExpand:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;border-radius:2px}
 .kb-thoughtMeta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
 .kb-thoughtChip{display:inline-flex;align-items:center;height:20px;max-width:100%;padding:0 7px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:transparent;color:var(--dsw-alias-label-primary);font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kb-thoughtChip:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
@@ -1361,6 +2887,30 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-thoughtEmpty{display:flex;flex-direction:column;align-items:center;gap:8px;padding:36px 16px;text-align:center;font-size:12px;line-height:1.55;color:var(--dsw-alias-label-secondary)}
 .kb-thoughtEmptyIcon{display:inline-flex;color:var(--dsw-alias-label-secondary);opacity:.8}
 .kb-thoughtCounter{align-self:flex-end;font-size:10px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+.kb-thoughtVoice{display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap}
+.kb-thoughtVoiceToggle{flex:none}
+.kb-thoughtVoiceToggle[aria-pressed="true"]{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.kb-thoughtVoiceToggle[aria-pressed="true"]:hover:not(:disabled){background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);opacity:.9}
+.kb-thoughtVoiceToggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.kb-thoughtVoiceDot{width:7px;height:7px;flex:none;border-radius:999px;background:var(--dsw-alias-brand-primary);animation:kb-pulse 1.2s ease-in-out infinite}
+.kb-thoughtVoiceState{min-width:0;font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-thoughtVoiceState--error{color:var(--dsw-alias-state-error-primary)}
+.kb-srOnly{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0}
+@media (prefers-reduced-motion:reduce){.kb-thoughtVoiceDot{animation:none}}
+.kb-thoughtHint{font-size:10.5px;color:var(--dsw-alias-state-warn-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.kb-thoughtDetail{display:flex;flex-direction:column;gap:5px;min-width:0;padding-top:2px;border-top:1px solid var(--dsw-alias-border-l1)}
+.kb-thoughtDetailHead{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--dsw-alias-label-secondary)}
+.kb-thoughtTimeline{display:flex;flex-direction:column;gap:3px;margin:0;padding:0;list-style:none;min-width:0}
+.kb-thoughtTimelineItem{display:flex;align-items:baseline;gap:8px;min-width:0;font-size:11px;line-height:1.45;color:var(--dsw-alias-label-primary)}
+.kb-thoughtTimelineAt{flex:none;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
+.kb-thoughtTimelineText{min-width:0;overflow-wrap:anywhere}
+.kb-thoughtControls{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-thoughtRetryOf{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary);min-width:0}
+.kb-thoughtEditForm{display:flex;flex-direction:column;gap:6px;min-width:0}
+.kb-thoughtEditFoot{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.kb-ticketThoughtRow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-ticketThoughtLabel{font-size:11px;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-ticketThoughtDeleted{font-size:11px;font-style:italic;color:var(--dsw-alias-label-secondary)}
 @container kb (max-width:660px){.kb-drawer--thoughts{width:100%}}
 .kb-formField{display:flex;flex-direction:column;gap:4px;min-width:0}
 .kb-textarea{width:100%;min-height:96px;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:1.5;resize:vertical;outline:none}
@@ -1403,6 +2953,186 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 .kb-roleDodCheck{display:inline-flex;flex:none;margin-top:1px;color:var(--dsw-alias-state-success-primary)}
 .kb-roleEmpty{padding:10px 2px;font-size:11px;color:var(--dsw-alias-label-secondary)}
 @container kb (max-width:660px){.kb-drawer--member{width:100%}.kb-drawer--roles{width:100%}.kb-rolesBody{flex-direction:column}.kb-rolesList{width:100%;flex-direction:row;overflow-x:auto;overflow-y:hidden;border-right:0;border-bottom:1px solid var(--dsw-alias-border-l1)}.kb-roleBtn{width:auto;max-width:180px;flex:none}}
+/* KB-76 autopilot control surface. Theme tokens only; the popover becomes a
+   full-height panel at the 660px container breakpoint so nothing clips or
+   overlaps the board header controls. */
+.kb-autopilotWrap{position:relative;display:flex;min-width:0;flex:none}
+.kb-apPopover{position:absolute;top:34px;right:0;z-index:45;display:flex;flex-direction:column;gap:10px;width:min(372px,calc(100vw - 24px));max-height:min(560px,calc(100vh - 120px));overflow-y:auto;padding:12px;background:var(--kb-panel-surface);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:var(--kb-panel-shadow);--kb-ap-ok:color-mix(in srgb,var(--dsw-alias-state-success-primary) 50%,var(--dsw-alias-label-primary));--kb-ap-warn:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 50%,var(--dsw-alias-label-primary));--kb-ap-err:color-mix(in srgb,var(--dsw-alias-state-error-primary) 42%,var(--dsw-alias-label-primary))}
+.kb-apHead{display:flex;align-items:center;gap:8px;min-width:0}
+.kb-apTitle{flex:1;min-width:0;font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-apState{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 7px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);font-size:10px;font-weight:600;white-space:nowrap;flex:none;color:var(--dsw-alias-label-secondary)}
+.kb-apState--on{color:var(--kb-ap-ok);border-color:currentColor}
+.kb-apState--off{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l2)}
+.kb-apState--paused{color:var(--kb-ap-warn);border-color:currentColor}
+.kb-apState--unavailable{color:var(--kb-ap-err);border-color:currentColor}
+.kb-apNote{font-size:11px;line-height:1.45;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-apNote--warn{color:var(--kb-ap-warn)}
+.kb-apSwitch{display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;text-align:left}
+.kb-apSwitch:hover:not(:disabled){border-color:var(--dsw-alias-border-l2)}
+.kb-apSwitch:disabled{opacity:.55}
+.kb-apSwitchTrack{position:relative;display:inline-flex;align-items:center;width:30px;height:18px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);flex:none;transition:background .12s ease,border-color .12s ease}
+.kb-apSwitchKnob{position:absolute;left:2px;width:12px;height:12px;border-radius:999px;background:var(--dsw-alias-label-secondary);transition:transform .12s ease,background .12s ease}
+.kb-apSwitch[aria-pressed="true"] .kb-apSwitchTrack{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.kb-apSwitch[aria-pressed="true"] .kb-apSwitchKnob{transform:translateX(12px);background:var(--dsw-alias-bg-base)}
+.kb-apSwitchText{flex:1;min-width:0;font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-apSwitchState{font-size:11px;color:var(--dsw-alias-label-secondary);flex:none;white-space:nowrap}
+.kb-apPhase1{display:flex;flex-direction:column;gap:5px;padding:9px;border:1px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 40%,var(--dsw-alias-border-l1));border-radius:10px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 7%,transparent)}
+.kb-apPhase1Title{font-size:11.5px;font-weight:600;color:var(--dsw-alias-brand-primary)}
+.kb-apPhase1Body{font-size:11px;line-height:1.5;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kb-apFields{display:grid;grid-template-columns:1fr 1fr;gap:8px;min-width:0}
+.kb-apField{display:flex;flex-direction:column;gap:3px;min-width:0}
+.kb-apFieldLabel{font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kb-apFieldCaps{grid-column:1 / -1;min-width:0}
+.kb-apCapsGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}
+.kb-apCapsGrid .kb-apField{min-width:0}
+.kb-apSelect{width:100%;min-width:0;height:28px;padding:0 6px;border:1px solid var(--dsw-alias-border-l1);border-radius:7px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12px;outline:none}
+.kb-apSelect:focus{border-color:var(--dsw-alias-border-l2)}
+.kb-apSelect:disabled{opacity:.55}
+.kb-apBudget{display:flex;flex-direction:column;gap:2px;padding:8px 9px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
+.kb-apBudgetTitle{font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.kb-apBudgetRow{font-size:11.5px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kb-apError{display:flex;align-items:flex-start;gap:6px;padding:8px 9px;border:1px solid var(--dsw-alias-state-error-primary);border-radius:10px;background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,transparent);color:var(--kb-ap-err);font-size:11px;line-height:1.45}
+.kb-apErrorText{flex:1;min-width:0;overflow-wrap:anywhere}
+.kb-apErrorCode{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px}
+.kb-apErrorDismiss{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:0;border-radius:5px;background:transparent;color:currentColor;flex:none}
+.kb-apErrorDismiss:hover{background:var(--dsw-alias-bg-layer-2)}
+.kb-apActions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-apActions .kb-btn{min-width:0}
+.kb-apSaving{font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap}
+.kb-apPreview{display:flex;flex-direction:column;gap:6px;min-width:0}
+.kb-apPreviewHead{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-apPreviewTitle{font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.kb-apPreviewCount{font-size:10px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+.kb-apEmpty{padding:8px;border:1px dashed var(--dsw-alias-border-l2);border-radius:8px;font-size:11px;line-height:1.45;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-apEmptyTitle{font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-primary);margin-bottom:2px}
+.kb-apList{display:flex;flex-direction:column;gap:6px;margin:0;padding:0;list-style:none}
+.kb-apRow{display:flex;flex-direction:column;gap:2px;min-width:0;padding:7px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
+.kb-apRow--dispatch{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 40%,var(--dsw-alias-border-l1));background:color-mix(in srgb,var(--dsw-alias-brand-primary) 6%,var(--dsw-alias-bg-layer-1))}
+.kb-apRowTop{display:flex;align-items:center;gap:5px;min-width:0}
+.kb-apRowIndex{font-size:10px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-apRowId{font-size:10px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-apRowTitle{font-size:11.5px;font-weight:500;min-width:0;flex:1;overflow:hidden;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.kb-apRowMeta{display:flex;align-items:center;gap:4px;row-gap:2px;flex-wrap:wrap;min-width:0;font-size:10px;color:var(--dsw-alias-label-secondary)}
+.kb-apRowReason{font-size:11px;line-height:1.4;overflow-wrap:anywhere}
+.kb-apRow--dispatch .kb-apRowReason{color:var(--dsw-alias-label-primary);font-weight:500}
+.kb-apRowDetail{font-size:10px;line-height:1.4;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+/* KB-77 observability: countdown, pulse feed, deduplicated alerts. Text carries
+   every state; colour is reinforcement only. */
+.kb-apCountdown{display:inline-flex;align-items:center;gap:4px;flex:none;font-size:10px;color:var(--dsw-alias-label-secondary);white-space:nowrap;font-variant-numeric:tabular-nums}
+.kb-apCountdownLabel{font-size:9.5px;letter-spacing:.03em;text-transform:uppercase}
+.kb-apCountdownValue{font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.kb-apCountdown--off .kb-apCountdownValue,.kb-apCountdown--paused .kb-apCountdownValue{color:var(--kb-ap-warn);font-weight:500;text-transform:none}
+.kb-apObservability{display:flex;flex-direction:column;gap:8px;min-width:0}
+.kb-apAlerts{display:flex;flex-direction:column;gap:6px;min-width:0}
+.kb-apAlert{display:flex;flex-direction:column;gap:4px;min-width:0;padding:8px 9px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-warn-primary) 55%,var(--dsw-alias-border-l1));border-radius:9px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 8%,transparent)}
+.kb-apAlertTop{display:flex;align-items:center;gap:5px;min-width:0;color:var(--kb-ap-warn)}
+.kb-apAlertTitle{flex:1;min-width:0;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--kb-ap-warn)}
+.kb-apAlertTime{font-size:10px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-apAlertText{font-size:11px;line-height:1.45;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kb-apAlertActions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-apAlertTicket{display:inline-flex;align-items:center;gap:3px;height:22px;padding:0 7px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:10.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.kb-apAlertTicket:hover{border-color:var(--dsw-alias-border-l2)}
+.kb-apAlertAck{display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 7px;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10.5px}
+.kb-apAlertAck:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.kb-apAlertTicket:focus-visible,.kb-apAlertAck:focus-visible,.kb-apPulseHead:focus-visible,.kb-apFeedAction:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.kb-apFeed{display:flex;flex-direction:column;gap:6px;min-width:0}
+.kb-apFeedHead{display:flex;align-items:center;gap:6px;min-width:0}
+.kb-apFeedTitle{flex:1;min-width:0;font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-apFeedCount{font-size:10px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-apFeedNote{font-size:11px;line-height:1.45;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-apFeedEmpty{min-height:66px;padding:9px;border:1px dashed var(--dsw-alias-border-l2);border-radius:9px;display:flex;flex-direction:column;gap:5px;align-items:flex-start}
+.kb-apFeedEmptyTitle{font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kb-apFeedEmptyBody{font-size:11px;line-height:1.45;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-apPulseList{display:flex;flex-direction:column;gap:5px;margin:0;padding:0;list-style:none;min-height:66px}
+.kb-apPulse{display:flex;flex-direction:column;min-width:0;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);overflow:hidden}
+.kb-apPulse--error{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 55%,var(--dsw-alias-border-l1))}
+.kb-apPulseHead{display:flex;flex-direction:column;gap:3px;width:100%;min-width:0;padding:6px 8px;border:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;text-align:left}
+.kb-apPulseHead:hover{background:var(--dsw-alias-bg-layer-2)}
+.kb-apPulseTop{display:flex;align-items:center;gap:5px;min-width:0;flex-wrap:wrap}
+.kb-apTrigger{display:inline-flex;align-items:center;height:16px;padding:0 5px;border-radius:4px;border:1px solid var(--dsw-alias-border-l1);font-size:9.5px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-apTrigger--manual{color:var(--dsw-alias-brand-primary);border-color:currentColor}
+.kb-apTrigger--resume{color:var(--kb-ap-ok);border-color:currentColor}
+.kb-apTrigger--restart{color:var(--kb-ap-warn);border-color:currentColor}
+.kb-apPulseTime{font-size:10.5px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-primary);flex:none}
+.kb-apPulseError{display:inline-flex;align-items:center;gap:2px;font-size:9.5px;font-weight:600;color:var(--kb-ap-warn);flex:none}
+.kb-apPulseMeta{display:flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0;font-size:10px;color:var(--dsw-alias-label-secondary)}
+.kb-apPulseDetail{display:flex;flex-direction:column;gap:5px;min-width:0;padding:7px 8px 8px;border-top:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-base)}
+.kb-apFeedSubTitle{font-size:9.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--dsw-alias-label-secondary)}
+.kb-apDecisionList,.kb-apExecutedList{display:flex;flex-direction:column;gap:4px;margin:0;padding:0;list-style:none;min-width:0}
+.kb-apDecision{display:flex;flex-direction:column;gap:2px;min-width:0;padding:5px 6px;border-radius:6px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1)}
+.kb-apDecision--alert{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 55%,var(--dsw-alias-border-l1))}
+.kb-apDecisionTop{display:flex;align-items:center;gap:4px;min-width:0;flex-wrap:wrap}
+.kb-apDecisionAction{display:inline-flex;align-items:center;height:15px;padding:0 4px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;flex:none;border:1px solid currentColor;color:var(--dsw-alias-label-secondary)}
+.kb-apDecisionAction--dispatch{color:var(--dsw-alias-brand-primary)}
+.kb-apDecisionAction--skip{color:var(--dsw-alias-label-secondary)}
+.kb-apDecisionId{font-size:10px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary);flex:none}
+.kb-apDecisionTitle{font-size:10.5px;font-weight:500;min-width:0;overflow-wrap:anywhere;color:var(--dsw-alias-label-primary)}
+.kb-apDecisionMeta{display:flex;align-items:center;gap:3px;flex-wrap:wrap;min-width:0;font-size:9.5px;color:var(--dsw-alias-label-secondary)}
+.kb-apDecisionReason{font-size:10.5px;line-height:1.4;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kb-apDecisionDetail,.kb-apDecisionNote{font-size:9.5px;line-height:1.4;color:var(--dsw-alias-label-secondary);overflow-wrap:anywhere}
+.kb-apDecisionNote{color:var(--kb-ap-warn)}
+.kb-apExecuted{display:flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0;font-size:10px;color:var(--dsw-alias-label-secondary)}
+.kb-btn--alert{color:var(--dsw-alias-state-warn-primary)}
+.kb-btnBadge--alert{background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-bg-base)}
+/* KB-77 lane admission chip: one stable bar under every workflow column head so
+   a pulse arriving (or an execution ending) never shifts the board layout. */
+.kb-colAdmissionBar{display:flex;align-items:center;gap:4px;min-height:19px;padding:0 10px 3px;min-width:0}
+.kb-colAdmissionBar--none{min-height:19px}
+.kb-colAdmission{display:inline-flex;align-items:center;gap:4px;min-width:0;height:16px;padding:0 5px;border-radius:4px;border:1px solid var(--dsw-alias-border-l1);font-size:9.5px;letter-spacing:.02em;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kb-colAdmissionState{font-weight:600}
+.kb-colAdmissionCap{font-variant-numeric:tabular-nums;opacity:.85}
+.kb-colAdmission--busy{color:var(--kb-ap-warn);border-color:currentColor}
+.kb-colAdmission--idle{color:var(--kb-ap-ok);border-color:currentColor}
+.kb-colAdmission--paused{color:var(--dsw-alias-label-secondary);border-color:var(--dsw-alias-border-l2)}
+/* KB-77 member autopilot state line in the Team rail. */
+.kb-rosterAuto{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.kb-rosterAutoChip{display:inline-flex;align-items:center;gap:4px;min-width:0;font-size:10.5px;color:var(--dsw-alias-label-secondary)}
+.kb-rosterAutoChip>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-rosterAuto--active .kb-rosterAutoChip{color:var(--kb-ap-ok)}
+.kb-rosterAuto--paused .kb-rosterAutoChip{color:var(--kb-ap-warn)}
+.kb-rosterAuto--no-work .kb-rosterAutoChip{color:var(--dsw-alias-label-secondary)}
+@container kb (max-width:660px){.kb-apPopover{position:fixed;top:56px;left:0;right:0;bottom:0;width:auto;max-height:none;border-radius:0;border-left:0;border-right:0;border-bottom:0;padding:14px 12px}.kb-apFields{grid-template-columns:1fr}.kb-apHead{flex-wrap:wrap;row-gap:4px}.kb-apCountdown{margin-left:auto}}
+/* kb-md */
+.kb-md{display:flex;flex-direction:column;min-width:0;max-width:100%;font-size:12px;line-height:1.55;color:var(--dsw-alias-label-primary);overflow-wrap:anywhere}
+.kb-md>:first-child{margin-top:0}
+.kb-md>:last-child{margin-bottom:0}
+.kb-md p{margin:0 0 8px}
+.kb-md h3,.kb-md h4,.kb-md h5,.kb-md h6{margin:14px 0 6px;font-weight:600;line-height:1.3;overflow-wrap:anywhere}
+.kb-md h3{font-size:15px}
+.kb-md h4{font-size:13.5px}
+.kb-md h5{font-size:12.5px}
+.kb-md h6{font-size:11.5px}
+.kb-md ul,.kb-md ol{margin:0 0 8px;padding-left:20px}
+.kb-md li{margin:2px 0}
+.kb-md li>ul,.kb-md li>ol{margin:2px 0;padding-left:18px}
+.kb-md strong{font-weight:600}
+.kb-md em{font-style:italic}
+.kb-md del{text-decoration:line-through;color:var(--dsw-alias-label-secondary)}
+.kb-md code{padding:1px 4px;border:1px solid var(--dsw-alias-border-l1);border-radius:4px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.kb-md pre{max-height:240px;margin:0 0 10px;padding:8px 10px;overflow:auto;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);white-space:pre;overflow-wrap:normal}
+.kb-md pre code{padding:0;border-width:0;border-radius:0;background:var(--dsw-alias-bg-layer-1);font-size:11px;line-height:1.5}
+.kb-md pre:focus-visible,.kb-md-tableWrap:focus-visible,.kb-md a:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;border-radius:2px}
+.kb-md blockquote{margin:0 0 10px;padding:6px 10px;border-left:3px solid var(--dsw-alias-border-l2);border-radius:0 6px 6px 0;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary)}
+.kb-md hr{margin:12px 0;border-top:1px solid var(--dsw-alias-border-l1)}
+.kb-md a{color:var(--dsw-alias-brand-primary);text-decoration:underline;text-underline-offset:2px}
+.kb-md-linkIcon{margin-left:3px;vertical-align:-2px;flex:none;color:var(--dsw-alias-label-secondary)}
+.kb-md input[type="checkbox"]{margin:0 4px 0 0;vertical-align:-2px;pointer-events:none;accent-color:var(--dsw-alias-brand-primary)}
+.kb-md-tableWrap{max-width:100%;margin:0 0 10px;overflow-x:auto;border:1px solid var(--dsw-alias-border-l1);border-radius:8px}
+.kb-md table{min-width:100%;border-collapse:collapse;font-size:11.5px}
+.kb-md th,.kb-md td{min-width:64px;padding:5px 8px;border-bottom:1px solid var(--dsw-alias-border-l1);text-align:left;vertical-align:top}
+.kb-md th{background:var(--dsw-alias-bg-layer-1);font-weight:600;white-space:nowrap}
+.kb-md th[data-align="center"],.kb-md td[data-align="center"]{text-align:center}
+.kb-md th[data-align="right"],.kb-md td[data-align="right"]{text-align:right}
+/* /kb-md */
+/* KB-59: the shared .kb-md inside the drawer's agent-written surfaces (comment body,
+   .kb-execReport, .kb-waitBox). Each wrapper keeps its own chrome — the comment
+   block, the 120px report scroller, the wait box — so only the type scale is
+   tailored to the compact surface, and the wait box inherits its existing colour
+   (grey hint for the block reason, primary label for questions and needs). */
+.kb-commentText .kb-md{font-size:12px;line-height:1.45}
+.kb-execReport .kb-md{font-size:11.5px;line-height:1.5}
+.kb-waitBox .kb-md{font-size:11.5px;line-height:1.45;color:inherit}
+.kb-waitNeed .kb-md{flex:1;min-width:0}
 `
 
 		// ------------------------------------------------------------------
@@ -1490,6 +3220,17 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				h('path', { d: 'M13.4 10.6v1.2a1.2 1.2 0 0 1-1.2 1.2h-1.3' }),
 				h('path', { d: 'M5.1 13H3.8a1.2 1.2 0 0 1-1.2-1.2v-1.2' }),
 				h('circle', { cx: 8, cy: 8, r: 1.9 }),
+			)
+		}
+
+		function IconMic(props) {
+			return h(
+				Svg,
+				props,
+				h('rect', { x: 5.7, y: 2.4, width: 4.6, height: 7.1, rx: 2.3 }),
+				h('path', { d: 'M3.5 7.5a4.5 4.5 0 0 0 9 0' }),
+				h('path', { d: 'M8 12.3v2' }),
+				h('path', { d: 'M5.9 14.3h4.2' }),
 			)
 		}
 
@@ -1586,6 +3327,11 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			)
 		}
 
+		/** KB-76 autopilot entry icon (a pulse/bolt). */
+		function IconBolt(props) {
+			return h(Svg, props, h('path', { d: 'M9 1.8 3.6 9h3.3l-.9 5.2L11.8 7H8.2z' }))
+		}
+
 		function Spinner() {
 			return h('span', { className: 'kb-spinner', 'aria-hidden': 'true' })
 		}
@@ -1606,6 +3352,10 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					title: props.title,
 					'aria-label': props['aria-label'] || props.title,
 					'aria-pressed': props.pressed === undefined ? undefined : props.pressed === true,
+					'aria-expanded': props['aria-expanded'],
+					'aria-haspopup': props['aria-haspopup'],
+					'aria-busy': props['aria-busy'],
+					autoFocus: props.autoFocus === true ? true : undefined,
 					onClick: props.onClick,
 				},
 				props.icon ? h('span', { className: 'kb-btnIcon' }, props.icon) : null,
@@ -1665,6 +3415,10 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		function defaultSuccessText(action, value, payload, t) {
 			const result = value && typeof value === 'object' ? value : {}
 			if (action === 'submitThought') return t('thought.success')
+			if (action === 'retryThought') return t('thought.retriedToast', { id: safeString(result.thought && result.thought.id) })
+			if (action === 'cancelThought') return t('thought.cancelledToast')
+			if (action === 'editThought') return t('thought.editedToast')
+			if (action === 'deleteThought') return t('thought.deletedToast')
 			if (action === 'createTicket' && result.ticket) return t('toast.created', { id: result.ticket.id })
 			if (action === 'moveTicket') {
 				const column = result.ticket && result.ticket.column ? result.ticket.column : payload && payload.column
@@ -1905,6 +3659,641 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		}
 
 		// ------------------------------------------------------------------
+		// Autopilot header entry + settings popover (KB-76)
+		// ------------------------------------------------------------------
+		//
+		// One header entry opens the popover; the master toggle lives inside it so
+		// the header stays uncrowded at narrow panel widths. The popover is the
+		// single place for settings, budget read-out, dry-run preview, Pulse now and
+		// inline host errors. Everything renders from the snapshot read model; the
+		// optimistic values in `state.values` are rolled back by the reducer.
+
+		function AutopilotEntryButton(props) {
+			const { t, stateKey, open, onOpen, onClose, entryRef, alertCount } = props
+			const stateText = t('autopilot.state.' + stateKey)
+			const alerts = Math.max(0, safeNumber(alertCount, 0))
+			const alertText = alerts > 0 ? t('autopilot.entryAlerts', { n: String(alerts) }) : ''
+			const entryLabel = t('autopilot.entryState', { state: stateText }) + (alertText ? ' · ' + alertText : '')
+			return h(
+				Button,
+				{
+					variant: 'ghost',
+					className: classNames('kb-autopilotEntry', open && 'kb-btn--active', alerts > 0 && 'kb-btn--alert'),
+					icon: h(IconBolt, { size: 15 }),
+					title: entryLabel,
+					'aria-label': entryLabel,
+					'aria-haspopup': 'dialog',
+					'aria-expanded': open ? 'true' : 'false',
+					buttonRef: entryRef,
+					onClick: () => (open ? onClose() : onOpen()),
+				},
+				h('span', { className: 'kb-btnLabel kb-btnLabel--secondary' }, t('autopilot.entry')),
+				alerts > 0 ? h('span', { className: 'kb-btnBadge kb-btnBadge--alert' }, String(alerts)) : null,
+			)
+		}
+
+		/**
+		 * mm:ss countdown to `nextTickAt` (AC 4). The interval lives in this leaf
+		 * component so the page tree is not re-rendered once per second, and the
+		 * reducer coalesces sub-second updates. Off/paused stop the interval and
+		 * render the explicit word instead of a frozen number.
+		 */
+		function AutopilotCountdown(props) {
+			const { t, view } = props
+			const [countdown, setCountdown] = useState(() => initialAutopilotCountdown())
+			const countdownRef = useRef(countdown)
+			countdownRef.current = countdown
+			useEffect(() => {
+				if (!view || typeof view !== 'object') return
+				setCountdown((previous) =>
+					reduceAutopilotCountdown(previous, {
+						type: 'sync',
+						available: view.available === true,
+						enabled: Boolean(view.config && view.config.enabled === true),
+						paused: view.paused === true,
+						nextTickAt: view.nextTickAt,
+						hostNow: view.hostNow,
+						localNow: Date.now(),
+					}),
+				)
+			}, [view])
+			useEffect(() => {
+				if (autopilotCountdownMode(countdownRef.current) !== 'running') return undefined
+				const timer = window.setInterval(() => {
+					setCountdown((previous) => reduceAutopilotCountdown(previous, { type: 'tick', localNow: Date.now() }))
+				}, 1000)
+				return () => window.clearInterval(timer)
+			}, [countdown.nextTickAt, countdown.available, countdown.enabled, countdown.paused])
+			const mode = autopilotCountdownMode(countdown)
+			const label = autopilotCountdownLabel(countdown, t)
+			return h(
+				'span',
+				{
+					className: 'kb-apCountdown kb-apCountdown--' + mode,
+					role: 'timer',
+					title: t('autopilot.countdown.label'),
+					'aria-label': autopilotCountdownAria(countdown, t),
+				},
+				h('span', { className: 'kb-apCountdownLabel' }, t('autopilot.countdown.label')),
+				h('span', { className: 'kb-apCountdownValue' }, label),
+			)
+		}
+
+		/**
+		 * Autopilot observability section: deduplicated alerts above the pulse feed
+		 * (AC 5) and the newest ≤20 pulses with an expandable decision region
+		 * (AC 1/AC 6/AC 7). Rows are real buttons, so keyboard focus and
+		 * Enter/Space expansion are native; every state is carried by text.
+		 */
+		function AutopilotObservability(props) {
+			const { t, feed, alerts, feedState, expandedPulseId, onTogglePulse, onAck, onOpenTicket, onEnable, enabled, available, saving } = props
+			const rows = safeArray(feed && feed.rows)
+			const alertRows = safeArray(alerts)
+			return h(
+				'div',
+				{ className: 'kb-apObservability' },
+				alertRows.length > 0
+					? h(
+							'div',
+							{ className: 'kb-apAlerts', role: 'group', 'aria-label': t('autopilot.alert.group') },
+							alertRows.map((alert) =>
+								h(
+									'div',
+									{ key: alert.key, className: 'kb-apAlert', role: 'alert' },
+									h(
+										'div',
+										{ className: 'kb-apAlertTop' },
+										h(IconWarning, { size: 12 }),
+										h('span', { className: 'kb-apAlertTitle' }, t('autopilot.alert.title')),
+										alert.time ? h('span', { className: 'kb-apAlertTime' }, alert.time) : null,
+									),
+									alert.message ? h('div', { className: 'kb-apAlertText' }, alert.message) : null,
+									alert.reasons.length > 0 ? h('div', { className: 'kb-apAlertText' }, alert.reasons.join(' · ')) : null,
+									h(
+										'div',
+										{ className: 'kb-apAlertActions' },
+										alert.ticketIds.map((id) =>
+											h(
+												'button',
+												{
+													key: id,
+													type: 'button',
+													className: 'kb-apAlertTicket',
+													title: t('autopilot.alert.openTicket', { id }),
+													'aria-label': t('autopilot.alert.openTicket', { id }),
+													onClick: () => (typeof onOpenTicket === 'function' ? onOpenTicket(id) : null),
+												},
+												h(IconTicket, { size: 11 }),
+												h('span', null, id),
+											),
+										),
+										h(
+											'button',
+											{
+												type: 'button',
+												className: 'kb-apAlertAck',
+												title: t('autopilot.alert.ack'),
+												'aria-label': t('autopilot.alert.ack'),
+												onClick: () => (typeof onAck === 'function' ? onAck(alert.pulseId) : null),
+											},
+											h(IconCheck, { size: 12 }),
+											h('span', null, t('autopilot.alert.ack')),
+										),
+									),
+								),
+							),
+						)
+					: null,
+				h(
+					'div',
+					{ className: 'kb-apFeed' },
+					h(
+						'div',
+						{ className: 'kb-apFeedHead' },
+						h('span', { className: 'kb-apFeedTitle' }, t('autopilot.feedTitle')),
+						feedState === 'ready' ? h('span', { className: 'kb-apFeedCount' }, t('autopilot.feedCount', { n: String(rows.length) })) : null,
+					),
+					feedState === 'loading'
+						? h('div', { className: 'kb-apFeedNote', role: 'status' }, t('autopilot.feedLoading'))
+						: feedState === 'unavailable'
+							? h('div', { className: 'kb-apFeedNote' }, t('autopilot.feedUnavailable'))
+							: feedState === 'empty'
+								? h(
+										'div',
+										{ className: 'kb-apFeedEmpty' },
+										h('div', { className: 'kb-apFeedEmptyTitle' }, t(enabled && available ? 'autopilot.feedEmptyTitleOn' : 'autopilot.feedEmptyTitle')),
+										h('div', { className: 'kb-apFeedEmptyBody' }, t(enabled && available ? 'autopilot.feedEmptyBodyOn' : 'autopilot.feedEmptyBody')),
+										!enabled && available
+											? h(
+													Button,
+													{
+														size: 'sm',
+														variant: 'primary',
+														icon: h(IconBolt, { size: 12 }),
+														disabled: saving,
+														onClick: () => (typeof onEnable === 'function' ? onEnable() : null),
+													},
+													t('autopilot.feedEmptyAction'),
+												)
+											: null,
+									)
+								: h(
+										'ol',
+										{ className: 'kb-apPulseList' },
+										rows.map((row) => {
+											const expanded = expandedPulseId === row.key
+											const detailId = 'kb-ap-pulse-' + row.key.replace(/[^a-zA-Z0-9_-]/g, '-')
+											return h(
+												'li',
+												{ key: row.key, className: classNames('kb-apPulse', row.hasError && 'kb-apPulse--error'), 'data-pulse': row.id },
+												h(
+													'button',
+													{
+														type: 'button',
+														className: 'kb-apPulseHead',
+														'aria-expanded': expanded ? 'true' : 'false',
+														'aria-controls': detailId,
+														title: row.stamp,
+														'aria-label': t('autopilot.feedOpen', { id: row.id }),
+														'data-pulse': row.id,
+														onClick: () => (typeof onTogglePulse === 'function' ? onTogglePulse(row.key) : null),
+													},
+													h(
+														'span',
+														{ className: 'kb-apPulseTop' },
+														h('span', { className: 'kb-apTrigger kb-apTrigger--' + row.trigger }, row.triggerLabel),
+														h('span', { className: 'kb-apPulseTime' }, row.time),
+														row.hasError
+															? h(
+																	'span',
+																	{ className: 'kb-apPulseError', title: row.errorText },
+																	h(IconWarning, { size: 10 }),
+																	h('span', null, row.errorLabel),
+																)
+															: null,
+													),
+													h(
+														'span',
+														{ className: 'kb-apPulseMeta' },
+														h('span', null, row.durationText),
+														h('span', { 'aria-hidden': 'true' }, '·'),
+														h('span', null, t('autopilot.feedDispatched', { n: String(row.dispatchedCount) })),
+														h('span', { 'aria-hidden': 'true' }, '·'),
+														h('span', null, t('autopilot.feedSkipped', { n: String(row.skippedCount) })),
+													),
+												),
+												expanded
+													? h(
+															'div',
+															{
+																id: detailId,
+																className: 'kb-apPulseDetail',
+																role: 'region',
+																'aria-label': t('autopilot.feedDetails', { id: row.id }),
+															},
+															h('div', { className: 'kb-apFeedSubTitle' }, t('autopilot.feedDecisionTitle')),
+															row.decisions.length === 0
+																? h('div', { className: 'kb-apFeedNote' }, t('autopilot.feedNoDecisions'))
+																: h(
+																		'ul',
+																		{ className: 'kb-apDecisionList' },
+																		row.decisions.map((decision) =>
+																			h(
+																				'li',
+																				{
+																					key: decision.key,
+																					className: classNames('kb-apDecision', decision.alert && 'kb-apDecision--alert'),
+																					'data-action': decision.action,
+																					'data-reason': decision.reasonCode,
+																					'data-ticket': decision.ticketId || '',
+																					'data-member': decision.memberName,
+																				},
+																				h(
+																					'div',
+																					{ className: 'kb-apDecisionTop' },
+																					h('span', { className: 'kb-apDecisionAction kb-apDecisionAction--' + decision.action }, decision.actionLabel),
+																					h('span', { className: 'kb-apDecisionId' }, decision.ticketId || t('autopilot.boardLevel')),
+																					decision.ticketTitle ? h('span', { className: 'kb-apDecisionTitle' }, decision.ticketTitle) : null,
+																				),
+																				h(
+																					'div',
+																					{ className: 'kb-apDecisionMeta' },
+																					decision.memberName ? h('span', null, decision.memberName) : null,
+																					decision.memberRole ? h('span', null, '· ' + decision.memberRole) : null,
+																					decision.laneLabel ? h('span', null, '· ' + decision.laneLabel) : null,
+																				),
+																				h('div', { className: 'kb-apDecisionReason' }, decision.reason),
+																				decision.detail ? h('div', { className: 'kb-apDecisionDetail' }, decision.detail) : null,
+																				decision.notExecuted ? h('div', { className: 'kb-apDecisionNote' }, decision.notExecutedText) : null,
+																			),
+																		),
+																	),
+															h('div', { className: 'kb-apFeedSubTitle' }, t('autopilot.feedDispatchedTitle')),
+															row.executed.length === 0
+																? h('div', { className: 'kb-apFeedNote' }, t('autopilot.feedNoDispatched'))
+																: h(
+																		'ul',
+																		{ className: 'kb-apExecutedList' },
+																		row.executed.map((entry) =>
+																			h(
+																				'li',
+																				{ key: entry.key, className: 'kb-apExecuted', 'data-ticket': entry.ticketId || '' },
+																				h('span', { className: 'kb-apDecisionId' }, entry.ticketId || t('autopilot.boardLevel')),
+																				entry.ticketTitle ? h('span', { className: 'kb-apDecisionTitle' }, entry.ticketTitle) : null,
+																				entry.memberName ? h('span', { className: 'kb-apDecisionMeta' }, entry.memberName) : null,
+																			),
+																		),
+																	),
+														)
+													: null,
+											)
+										}),
+									),
+				),
+			)
+		}
+
+		function AutopilotControl(props) {
+			const { t, open, onOpen, onClose, onConfigure, onPreview, onPulse, onDismissError, onDismissPhase1, entryRef, wrapRef, roleName, onOpenTicket } = props
+			const view = props.view && typeof props.view === 'object' ? props.view : autopilotViewFromSnapshot(null)
+			const ui = props.state && typeof props.state === 'object' ? props.state : initialAutopilotUi(null)
+			const values = ui.values || view.config
+			const available = ui.available === true
+			const enabled = Boolean(values && values.enabled === true)
+			const busy = ui.busy
+			const saving = busy === 'configure'
+			const previewing = busy === 'preview'
+			const pulsing = busy === 'pulse'
+			const stateKey = autopilotStateLabel(ui)
+			const budgetRows = autopilotBudgetRows(ui.budget, t)
+			// KB-77: the feed and its alerts are merged locally per pulse id, so a
+			// poll can never duplicate a row, clear an unread alert or un-acknowledge
+			// one; the component stays mounted while the popover opens and closes.
+			const [pulseState, setPulseState] = useState(() => initialAutopilotPulseState())
+			const [expandedPulseId, setExpandedPulseId] = useState(null)
+			useEffect(() => {
+				setPulseState((previous) =>
+					reduceAutopilotPulseState(previous, { type: 'sync', hostNow: view.hostNow, pulses: view.pulses }),
+				)
+			}, [view])
+			// Before the first sync, render the polled ring directly so the popover
+			// never flashes "No pulses yet" for a board that already has history.
+			const feedPulses = pulseState.hostNow === null ? safeArray(view.pulses) : pulseState.pulses
+			const feedState = autopilotFeedState({ loading: props.loading === true, available, pulses: feedPulses })
+			const feed = buildAutopilotFeed(feedPulses, props.tickets, props.roster, t, roleName)
+			const alerts = available
+				? buildAutopilotAlerts(feedPulses, pulseState.acked, props.tickets, t)
+				: []
+			const acknowledgeAlert = (pulseId) => {
+				setPulseState((previous) => reduceAutopilotPulseState(previous, { type: 'ack', pulseId }))
+			}
+			const openAlertTicket = (ticketId) => {
+				if (typeof onOpenTicket === 'function') onOpenTicket(ticketId)
+			}
+			const previewModel = ui.preview
+				? buildAutopilotPreview(ui.preview, safeArray(props.tickets), safeArray(props.roster), t, roleName)
+				: null
+			const previewAllowed = canPreviewAutopilot(ui)
+			const pulseAllowed = canPulseAutopilot(ui)
+			const cadenceMinutes = Math.round(safeNumber(values && values.cadenceMs, 300000) / 60000)
+			const depth = Math.round(safeNumber(values && values.maxReadyDepth, 3))
+			const caps = (values && values.laneCaps) || { refine: 1, implement: 1, review: 1 }
+			const pauseNote =
+				ui.pauseCause === 'member' ? t('autopilot.pauseMember') : ui.pauseCause === 'board' ? t('autopilot.pauseBoard') : ''
+			const statusNote = stateKey === 'paused' ? pauseNote : stateKey === 'off' ? t('autopilot.offNote') : ''
+			const errorText = autopilotErrorText(ui.error, t)
+
+			const field = (label, control) =>
+				h('label', { className: 'kb-apField' }, h('span', { className: 'kb-apFieldLabel' }, label), control)
+
+			return h(
+				'div',
+				{ className: 'kb-autopilotWrap', ref: wrapRef },
+				h(AutopilotEntryButton, { t, stateKey, open, onOpen, onClose, entryRef, alertCount: alerts.length }),
+				open
+					? h(
+							'div',
+							{
+								className: 'kb-apPopover',
+								role: 'dialog',
+								'aria-label': t('autopilot.title'),
+								'aria-busy': busy === null ? undefined : 'true',
+							},
+							h(
+								'div',
+								{ className: 'kb-apHead' },
+								h('span', { className: 'kb-apTitle' }, t('autopilot.title')),
+								available ? h(AutopilotCountdown, { t, view }) : null,
+								h('span', { className: 'kb-apState kb-apState--' + stateKey }, t('autopilot.state.' + stateKey)),
+								h(Button, {
+									variant: 'ghost',
+									size: 'sm',
+									icon: h(IconClose, { size: 13 }),
+									title: t('header.close'),
+									'aria-label': t('header.close'),
+									onClick: onClose,
+								}),
+							),
+							!available
+								? h(
+										'div',
+										{ className: 'kb-apNote kb-apNote--warn', role: 'status' },
+										h('div', null, h('strong', null, t('autopilot.unavailableTitle'))),
+										h('div', null, t('autopilot.unavailableBody')),
+									)
+								: null,
+							statusNote ? h('div', { className: 'kb-apNote' }, statusNote) : null,
+							available && ui.membersPaused && !ui.paused
+								? h('div', { className: 'kb-apNote kb-apNote--warn' }, t('autopilot.membersPaused'))
+								: null,
+							h(
+								'button',
+								{
+									type: 'button',
+									className: 'kb-apSwitch',
+									'aria-pressed': enabled ? 'true' : 'false',
+									'aria-label': t('autopilot.toggleLabel'),
+									disabled: !available || saving,
+									autoFocus: !available,
+									onClick: () => onConfigure({ enabled: !enabled }),
+								},
+								h('span', { className: 'kb-apSwitchTrack', 'aria-hidden': 'true' }, h('span', { className: 'kb-apSwitchKnob' })),
+								h('span', { className: 'kb-apSwitchText' }, t('autopilot.toggleLabel')),
+								h('span', { className: 'kb-apSwitchState' }, t('autopilot.state.' + (enabled ? 'on' : 'off'))),
+							),
+							ui.phase1
+								? h(
+										'div',
+										{ className: 'kb-apPhase1', role: 'status' },
+										h('div', { className: 'kb-apPhase1Title' }, t('autopilot.phase1Title')),
+										h('div', { className: 'kb-apPhase1Body' }, t('autopilot.phase1Body')),
+										h(
+											'div',
+											{ className: 'kb-apActions' },
+											h(Button, { size: 'sm', onClick: onDismissPhase1 }, t('autopilot.phase1Dismiss')),
+										),
+									)
+								: null,
+							available
+								? h(
+										'div',
+										{ className: 'kb-apFields' },
+										field(
+											t('autopilot.cadence'),
+											h(
+												'select',
+												{
+													className: 'kb-apSelect',
+													value: String(cadenceMinutes),
+													'aria-label': t('autopilot.cadence'),
+													disabled: saving,
+													onChange: (event) => onConfigure({ cadenceMs: safeNumber(Number(event.target.value), 5) * 60000 }),
+												},
+												AUTOPILOT_CADENCE_MINUTES.map((minutes) =>
+													h('option', { key: String(minutes), value: String(minutes) }, t('autopilot.minutes', { n: String(minutes) })),
+												),
+											),
+										),
+										field(
+											t('autopilot.maxReadyDepth'),
+											h(
+												'select',
+												{
+													className: 'kb-apSelect',
+													value: String(depth),
+													'aria-label': t('autopilot.maxReadyDepth'),
+													disabled: saving,
+													onChange: (event) => onConfigure({ maxReadyDepth: safeNumber(Number(event.target.value), 3) }),
+												},
+												AUTOPILOT_DEPTH_OPTIONS.map((option) =>
+													h('option', { key: String(option), value: String(option) }, String(option)),
+												),
+											),
+										),
+										h(
+											'div',
+											{ className: 'kb-apField kb-apFieldCaps' },
+											h('span', { className: 'kb-apFieldLabel' }, t('autopilot.laneCaps')),
+											h(
+												'div',
+												{ className: 'kb-apCapsGrid' },
+												AUTOPILOT_LANES.map((lane) =>
+													field(
+														t('autopilot.lane.' + lane),
+														h(
+															'select',
+															{
+																className: 'kb-apSelect',
+																value: String(Math.round(safeNumber(caps[lane], 1))),
+																'aria-label': t('autopilot.lane.' + lane),
+																disabled: saving,
+																onChange: (event) =>
+																	onConfigure({ laneCaps: { [lane]: safeNumber(Number(event.target.value), 1) } }),
+															},
+															AUTOPILOT_LANE_CAP_OPTIONS.map((option) =>
+																h('option', { key: String(option), value: String(option) }, String(option)),
+															),
+														),
+													),
+												),
+											),
+										),
+									)
+								: null,
+							available
+								? h(
+										'div',
+										{ className: 'kb-apBudget' },
+										h('span', { className: 'kb-apBudgetTitle' }, t('autopilot.budget')),
+										budgetRows.length > 0
+											? budgetRows.map((text, index) => h('span', { key: String(index), className: 'kb-apBudgetRow' }, text))
+											: h('span', { className: 'kb-apBudgetRow' }, t('autopilot.budgetUnavailable')),
+									)
+								: null,
+							ui.error
+								? h(
+										'div',
+										{ className: 'kb-apError', role: 'alert' },
+										h(
+											'span',
+											{ className: 'kb-apErrorText' },
+											h('span', { className: 'kb-apErrorCode' }, t('autopilot.error', { code: ui.error.code })),
+											errorText ? h('span', null, ' ' + errorText) : null,
+										),
+										h(
+											'button',
+											{
+												type: 'button',
+												className: 'kb-apErrorDismiss',
+												title: t('autopilot.dismissError'),
+												'aria-label': t('autopilot.dismissError'),
+												onClick: onDismissError,
+											},
+											h(IconClose, { size: 12 }),
+										),
+									)
+								: null,
+							available && (enabled || saving)
+								? h(
+										'div',
+										{ className: 'kb-apActions' },
+										enabled
+											? h(
+													Button,
+													{
+														icon: previewing ? h(Spinner) : h(IconList, { size: 13 }),
+														title: t('autopilot.preview'),
+														disabled: !previewAllowed,
+														onClick: onPreview,
+													},
+													previewing ? t('autopilot.previewBusy') : t('autopilot.preview'),
+												)
+											: null,
+										enabled
+											? h(
+													Button,
+													{
+														variant: 'primary',
+														icon: pulsing ? h(Spinner) : h(IconBolt, { size: 13 }),
+														title: ui.paused ? t('autopilot.pulseDisabled') : t('autopilot.pulseNow'),
+														'aria-busy': pulsing ? 'true' : undefined,
+														disabled: !pulseAllowed,
+														onClick: onPulse,
+													},
+													pulsing ? t('autopilot.pulseBusy') : t('autopilot.pulseNow'),
+												)
+											: null,
+										saving ? h('span', { className: 'kb-apSaving' }, t('autopilot.saving')) : null,
+									)
+								: null,
+							previewModel
+								? h(
+										'div',
+										{ className: 'kb-apPreview', 'aria-live': 'polite' },
+										h(
+											'div',
+											{ className: 'kb-apPreviewHead' },
+											h('span', { className: 'kb-apPreviewTitle' }, t('autopilot.previewTitle')),
+											h(
+												'span',
+												{ className: 'kb-apPreviewCount' },
+												t('autopilot.previewSummary', {
+													dispatches: String(previewModel.dispatchCount),
+													skips: String(previewModel.skipCount),
+												}),
+											),
+										),
+										previewModel.empty
+											? h(
+													'div',
+													{ className: 'kb-apEmpty' },
+													h('div', { className: 'kb-apEmptyTitle' }, t('autopilot.previewEmptyTitle')),
+													h(
+														'div',
+														null,
+														t('autopilot.previewEmptyBody', {
+															summary: previewModel.summaryText || t('autopilot.reasonUnknown', { code: 'none' }),
+														}),
+													),
+												)
+											: null,
+										h(
+											'ol',
+											{ className: 'kb-apList' },
+											previewModel.rows.map((row) =>
+												h(
+													'li',
+													{
+														key: row.key,
+														className: 'kb-apRow' + (row.kind === 'dispatch' ? ' kb-apRow--dispatch' : ''),
+													},
+													h(
+														'div',
+														{ className: 'kb-apRowTop' },
+														h('span', { className: 'kb-apRowIndex' }, String(row.ordinal)),
+														h('span', { className: 'kb-apRowId' }, row.ticketId || t('autopilot.boardLevel')),
+														row.title ? h('span', { className: 'kb-apRowTitle' }, row.title) : null,
+													),
+													h(
+														'div',
+														{ className: 'kb-apRowMeta' },
+														h(
+															'span',
+															null,
+															row.memberName ? row.memberName : row.kind === 'dispatch' ? t('autopilot.noMember') : '',
+														),
+														row.memberRole ? h('span', null, '· ' + row.memberRole) : null,
+														row.laneLabel ? h('span', null, '· ' + row.laneLabel) : null,
+													),
+													h('div', { className: 'kb-apRowReason' }, row.reason),
+													row.detail ? h('div', { className: 'kb-apRowDetail', title: row.detail }, row.detail) : null,
+												),
+											),
+										),
+									)
+								: null,
+							available
+								? h(AutopilotObservability, {
+										t,
+										feed,
+										alerts,
+										feedState,
+										expandedPulseId,
+										onTogglePulse: (pulseId) => setExpandedPulseId((previous) => (previous === pulseId ? null : pulseId)),
+										onAck: acknowledgeAlert,
+										onOpenTicket: openAlertTicket,
+										onEnable: () => onConfigure({ enabled: true }),
+										enabled,
+										available,
+										saving,
+									})
+								: null,
+						)
+					: null,
+			)
+		}
+
+		// ------------------------------------------------------------------
 		// Menu components
 		// ------------------------------------------------------------------
 
@@ -2021,6 +4410,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		function cardTypeClass(type) {
 			if (type === 'bug') return 'error'
 			if (type === 'spike') return 'warn'
+			if (type === 'epic') return 'epic'
 			if (type === 'story') return 'brand'
 			return 'idle'
 		}
@@ -2126,7 +4516,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		}
 
 		function TicketCard(props) {
-			const { t, ticket, blocked, dragging, onOpen, onDragStart, onDragEnd, roleName, onRun, runPending } = props
+			const { t, ticket, blocked, dragging, onOpen, onDragStart, onDragEnd, roleName, onRun, runPending, parent, childCount, onOpenParent } = props
 			const checklist = safeArray(ticket.checklist)
 			const doneCount = checklist.filter((item) => item && item.done === true).length
 			const commentCount = safeArray(ticket.comments).length
@@ -2140,18 +4530,27 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const assignment = assignmentOf(ticket)
 			const showHandoff = Boolean(assignment) && !activeExecution
 			const laneRunnable = ['backlog', 'ready', 'review'].indexOf(ticket.column) !== -1
-			const canRun = !blockedChip && laneRunnable && !activeExecution
-			const draggable = !blockedChip && !activeExecution
+			// An EPIC is structural: it never runs, never drags, and always shows why.
+			const isEpic = ticket.type === 'epic'
+			const canRun = !blockedChip && laneRunnable && !activeExecution && !isEpic
+			const draggable = !blockedChip && !activeExecution && !isEpic
+			const cardTitle = isEpic
+				? t('card.epicLockedHint')
+				: blockedChip && ticket.blockReason
+					? t('card.blockedReason', { reason: ticket.blockReason })
+					: undefined
 			return h(
 				'article',
 				{
-					className: classNames('kb-card', dragging === true && 'kb-card--dragging'),
+					className: classNames('kb-card', dragging === true && 'kb-card--dragging', isEpic && 'kb-card--epic'),
 					draggable,
 					tabIndex: 0,
 					role: 'button',
 					'aria-label': t('card.open', { id: safeString(ticket.id) }),
+					'aria-disabled': isEpic ? 'true' : undefined,
 					'data-ticket': safeString(ticket.id),
-					title: blockedChip && ticket.blockReason ? t('card.blockedReason', { reason: ticket.blockReason }) : undefined,
+					'data-epic': isEpic ? 'true' : undefined,
+					title: cardTitle,
 					onClick: () => onOpen(ticket.id),
 					onKeyDown: (event) => {
 						if (event.key === 'Enter' || event.key === ' ') {
@@ -2174,6 +4573,39 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							{ className: 'kb-chip kb-chip--' + cardTypeClass(ticket.type), title: typeLabel(ticket.type, t) },
 							h('span', { className: 'kb-chipText' }, typeLabel(ticket.type, t)),
 						),
+						parent
+							? h(
+									'button',
+									{
+										type: 'button',
+										className: 'kb-chip kb-chip--parent',
+										title: t('card.parentTitle', { title: safeString(parent.title) }) || t('card.parent', { id: parent.id }),
+										'data-parent': safeString(parent.id),
+										onClick: (event) => {
+											event.stopPropagation()
+											if (typeof onOpenParent === 'function') onOpenParent(parent.id)
+										},
+										onKeyDown: (event) => {
+											event.stopPropagation()
+										},
+									},
+									h('span', { className: 'kb-chipText' }, t('card.parent', { id: safeString(parent.id) })),
+								)
+							: null,
+						isEpic
+							? h(
+									'span',
+									{ className: 'kb-chip kb-chip--idle', title: t('card.epicLockedHint'), 'data-epic-lock': 'true' },
+									h('span', { className: 'kb-chipText' }, t('card.epicLocked')),
+								)
+							: null,
+						isEpic && childCount > 0
+							? h(
+									'span',
+									{ className: 'kb-chip kb-chip--epic', title: t('card.children', { n: childCount }), 'data-child-count': String(childCount) },
+									h('span', { className: 'kb-chipText' }, t('card.children', { n: childCount })),
+								)
+							: null,
 						blockedChip
 							? h(
 									'span',
@@ -2288,7 +4720,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		}
 
 		function BoardColumn(props) {
-			const { t, column, tickets, totalCount, wipLimit, paused, isOver, drag, onOpenTicket, onAddTicket, roleName, onRun, pending } = props
+			const { t, column, tickets, totalCount, wipLimit, paused, isOver, drag, onOpenTicket, onAddTicket, roleName, onRun, pending, parentOf, childCountOf, onOpenParent, admission } = props
 			const list = safeArray(tickets)
 			const blockedColumn = column === 'blocked'
 			const wipClass =
@@ -2337,6 +4769,20 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 								h(IconPlus, { size: 14 }),
 							),
 				),
+				props.showAdmission === true
+					? h(
+							'div',
+							{ className: 'kb-colAdmissionBar' + (admission ? ' kb-colAdmissionBar--' + admission.state : ' kb-colAdmissionBar--none') },
+							admission
+								? h(
+										'span',
+										{ className: 'kb-colAdmission kb-colAdmission--' + admission.state, title: admission.ariaLabel, 'data-lane': admission.lane, 'data-state': admission.state },
+										h('span', { className: 'kb-colAdmissionState' }, admission.stateLabel),
+										h('span', { className: 'kb-colAdmissionCap' }, admission.capacityText),
+									)
+								: null,
+						)
+					: null,
 				h(
 					'div',
 					{ className: 'kb-colBody' },
@@ -2365,6 +4811,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									roleName,
 									onRun,
 									runPending: Boolean(pending && pending['execute:' + ticket.id]),
+									parent: typeof parentOf === 'function' ? parentOf(ticket) : null,
+									childCount: typeof childCountOf === 'function' ? childCountOf(ticket) : 0,
+									onOpenParent,
 								})
 							: null,
 					),
@@ -2373,8 +4822,14 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		}
 
 		function Board(props) {
-			const { t, columnTickets, allCounts, wipLimits, paused, drag, over, roleName, filterActive, onRun, pending } = props
+			const { t, columnTickets, allCounts, wipLimits, paused, drag, over, roleName, filterActive, onRun, pending, parentOf, childCountOf, onOpenParent, laneAdmissions } = props
 			const blockedTickets = safeArray(columnTickets.blocked)
+			const admissions = laneAdmissions && typeof laneAdmissions === 'object' ? laneAdmissions : null
+			const admissionFor = (column) => {
+				if (!admissions) return null
+				const lane = AUTOPILOT_LANE_BY_COLUMN[column]
+				return lane ? admissions[lane] || null : null
+			}
 			return h(
 				'div',
 				{ className: 'kb-board' },
@@ -2391,6 +4846,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 						filterActive,
 						drag,
 						roleName,
+						admission: admissionFor(column),
+						showAdmission: admissions !== null,
 						onOpenTicket: props.onOpenTicket,
 						onAddTicket: props.onAddTicket,
 						onDragStart: props.onDragStart,
@@ -2398,6 +4855,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 						onDragOver: props.onDragOver,
 						onDragLeave: props.onDragLeave,
 						onDrop: props.onDrop,
+						parentOf,
+						childCountOf,
+						onOpenParent,
 					}),
 				),
 				blockedTickets.length > 0
@@ -2413,9 +4873,14 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							filterActive,
 							drag,
 							roleName,
+							admission: null,
+							showAdmission: admissions !== null,
 							onOpenTicket: props.onOpenTicket,
 							onRun,
 							pending,
+							parentOf,
+							childCountOf,
+							onOpenParent,
 						})
 					: null,
 			)
@@ -2470,7 +4935,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		}
 
 		function MemberRosterRow(props) {
-			const { t, member, pending, roleName } = props
+			const { t, member, pending, roleName, autopilot } = props
 			const name = safeString(member.name) || safeString(member.id)
 			const status = MEMBER_STATUSES.indexOf(safeString(member.status)) === -1 ? 'idle' : member.status
 			const ticket = member.currentTicket && typeof member.currentTicket === 'object' ? member.currentTicket : null
@@ -2540,9 +5005,24 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					'div',
 					{ className: 'kb-rosterMeta' },
 					roleLabel ? h('span', { className: 'kb-tag', title: roleLabel }, h('span', { className: 'kb-tagText' }, roleLabel)) : null,
-					h('span', { className: 'kb-teamStatus', title: statusLabel(status, t) }, h(StatusDot, { status }), statusLabel(status, t)),
+					h('span', { className: 'kb-teamStatus', title: safeString(member.statusReason) || statusLabel(status, t) }, h(StatusDot, { status }), statusLabel(status, t)),
 					sinceText ? h('span', { className: 'kb-rosterMetaText', title: sinceText }, sinceText) : null,
 				),
+				autopilot
+					? h(
+							'div',
+							{ className: 'kb-rosterAuto kb-rosterAuto--' + autopilot.kind },
+							// Text only: a member at rest must not carry a pulsing green
+							// "engaged" dot. The row's single status dot pulses only while
+							// the member's attached agent is actually running.
+							h(
+								'span',
+								{ className: 'kb-rosterAutoChip', title: autopilot.ariaLabel, 'aria-label': autopilot.ariaLabel, 'data-autopilot': autopilot.kind, 'data-member': member.id },
+								h('span', null, autopilot.chipText),
+							),
+							h('span', { className: 'kb-rosterMetaText', title: autopilot.lastActiveText }, autopilot.lastActiveText),
+						)
+					: null,
 				h(
 					'div',
 					{ className: 'kb-rosterFoot' },
@@ -2631,7 +5111,6 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		function TeamRail(props) {
 			const {
 				t,
-				team,
 				roster,
 				drafts,
 				board,
@@ -2639,25 +5118,20 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				roles,
 				pending,
 				roleName,
+				autopilot,
 				onOpenTicket,
-				onToggleAgent,
-				onSetRole,
 				onToggleBoard,
 				onClose,
 				pauseBusy,
 			} = props
+			const autopilotView = autopilot && typeof autopilot === 'object' ? autopilot : null
+			const showAutopilot = Boolean(autopilotView && autopilotView.available === true)
+			// The team list is the fixed roster. Agent sessions are attachments that
+			// drive each member's status; they are never rendered as extra team rows.
 			const members = safeArray(roster).filter((member) => member && typeof member.id === 'string' && member.id)
 			const draftRows = safeArray(drafts).filter((draft) => draft && typeof draft.id === 'string' && draft.id)
-			const agents = safeArray(team).filter((agent) => agent && typeof agent.sessionId === 'string')
-			const linkedSessions = {}
-			members.forEach((member) => {
-				if (typeof member.sessionId === 'string' && member.sessionId) linkedSessions[member.sessionId] = true
-			})
-			// Roster-linked sessions also appear in the legacy team list; only the
-			// unlinked ones belong to the "Other agents" section.
-			const otherAgents = agents.filter((agent) => linkedSessions[agent.sessionId] !== true)
-			const working = members.filter((member) => member.status === 'working').length
-			const running = members.filter((member) => member.status === 'running').length + otherAgents.filter((agent) => agent.status === 'running').length
+			const running = members.filter((member) => member.status === 'running').length
+			const idle = members.filter((member) => member.status === 'idle').length
 			const activeTickets = safeArray(tickets).filter(
 				(ticket) => ticket && (ticket.column === 'in_progress' || ticket.column === 'review'),
 			).length
@@ -2683,70 +5157,6 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 						}
 					})
 					.catch(() => setAiBusy(false))
-			}
-			const agentRow = (agent) => {
-				const agentStatus = agent.paused === true ? 'paused' : safeString(agent.status) || 'idle'
-				const rolePending = (pending['role:' + agent.sessionId] || 0) > 0
-				const agentPending = (pending['agent:' + agent.sessionId] || 0) > 0
-				const name = safeString(agent.name) || agent.sessionId
-				const roleOption = roleOptions.find((role) => role && role.id === agent.role)
-				const agentRoleLabel = (roleOption && safeString(roleOption.name)) || safeString(agent.role)
-				const ticketTitle = safeString(agent.ticketTitle)
-				const ticketText = agent.ticketId ? safeString(agent.ticketId) + (ticketTitle ? ' · ' + ticketTitle : '') : ''
-				return h(
-					'div',
-					{ key: agent.sessionId, className: 'kb-teamRow' },
-					h(
-						'div',
-						{ className: 'kb-teamTop' },
-						h(Avatar, { name, lead: agent.isLead === true }),
-						h('span', { className: 'kb-teamName', title: name }, name),
-						agent.isLead === true ? h('span', { className: 'kb-tag' }, t('team.lead')) : null,
-						h('span', { className: 'kb-teamStatus', title: statusLabel(agentStatus, t) }, h(StatusDot, { status: agentStatus }), statusLabel(agentStatus, t)),
-						h(
-							'button',
-							{
-								type: 'button',
-								className: 'kb-btn kb-btn--ghost kb-btn--icon kb-btn--sm',
-								disabled: agentPending || agentStatus === 'failed',
-								title: (agent.paused === true ? t('actions.resumeAgent') : t('actions.pauseAgent')) + ' ' + name,
-								'aria-label': (agent.paused === true ? t('actions.resumeAgent') : t('actions.pauseAgent')) + ' ' + name,
-								onClick: () => onToggleAgent(agent),
-							},
-							agent.paused === true ? h(IconPlay, { size: 12 }) : h(IconPause, { size: 12 }),
-						),
-					),
-					h(
-						'div',
-						{ className: 'kb-teamBottom' },
-						h(
-							'select',
-							{
-								className: 'kb-teamRole',
-								value: safeString(agent.role),
-								disabled: rolePending || roleOptions.length === 0,
-								title: t('team.role') + ': ' + agentRoleLabel,
-								'aria-label': t('team.role') + ' ' + name,
-								onChange: (event) => onSetRole(agent, event.target.value),
-							},
-							roleOptions.map((role) => h('option', { key: role.id, value: role.id }, role.name)),
-						),
-						agent.ticketId
-							? h(
-									'button',
-									{
-										type: 'button',
-										className: 'kb-teamTicket',
-										title: (ticketTitle ? ticketTitle + ' · ' : '') + t('team.openTicket', { id: agent.ticketId }),
-										'aria-label': t('team.openTicket', { id: agent.ticketId }) + ' ' + ticketTitle,
-										onClick: () => onOpenTicket(agent.ticketId),
-									},
-									h(IconTicket, { size: 11 }),
-									h('span', { className: 'kb-teamTicketText' }, ticketText),
-								)
-							: h('span', { className: 'kb-teamNoTicket' }, t('team.noTicket')),
-					),
-				)
 			}
 			return h(
 				'aside',
@@ -2803,8 +5213,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							'div',
 							{ className: 'kb-summaryRow' },
 							h('span', { className: 'kb-chip' }, t('team.members', { n: members.length })),
-							h('span', { className: 'kb-chip' }, t('team.working', { n: working })),
 							h('span', { className: 'kb-chip' }, t('team.running', { n: running })),
+							h('span', { className: 'kb-chip' }, t('team.idle', { n: idle })),
 							h('span', { className: 'kb-chip' }, t('team.activeTickets', { n: activeTickets })),
 						),
 					),
@@ -2903,6 +5313,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 										member,
 										pending,
 										roleName,
+										autopilot: showAutopilot ? memberAutopilotState(member, autopilotView, t) : null,
 										onOpenTicket,
 										onEdit: props.onEditMember,
 										onTogglePause: props.onToggleMember,
@@ -2930,14 +5341,6 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 								),
 							)
 						: null,
-					h(
-						'div',
-						{ className: 'kb-railSection' },
-						h(SectionHead, { title: t('team.otherAgents'), count: otherAgents.length }),
-						otherAgents.length === 0
-							? h('div', { className: 'kb-emptyLine' }, t('team.otherAgentsEmpty'))
-							: otherAgents.map((agent) => agentRow(agent)),
-					),
 					h(
 						'div',
 						{ className: 'kb-railSection' },
@@ -3672,6 +6075,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					},
 					cancelArmed ? t('execution.confirmCancel') : t('execution.cancel'),
 				)
+			// An EPIC is structural: it never has an agent execution panel.
+			if (ticket.type === 'epic') return null
 			if (!execution && !blocked && !laneRunnable) return null
 			const executePending = (pending['execute:' + ticket.id] || 0) > 0
 			const answerPending = (pending['answer:' + ticket.id] || 0) > 0
@@ -3716,20 +6121,24 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					'div',
 					{ className: 'kb-waitBox' },
 					h('div', { className: 'kb-waitQ' }, h('strong', null, t('execution.waitingTitle')), h('span', { className: 'kb-execHint' }, t('execution.waitingHint'))),
+					// KB-59: the block reason is agent-written Markdown; the wait box keeps
+					// its hint styling, so the body inherits the hint colour.
 					(ticket.block && ticket.block.reason) || ticket.blockReason
-						? h('div', { className: 'kb-execHint' }, ticket.blockReason || ticket.block.reason)
+						? h('div', { className: 'kb-execHint' }, h(MarkdownBody, { text: ticket.blockReason || ticket.block.reason, t }))
 						: null,
 					questions.length > 0
 						? questions.map((question, index) =>
 								h(
 									'label',
 									{ key: question.id || index, className: 'kb-waitQ' },
-									h('span', null, question.text),
+									// The visible question renders as Markdown; the input keeps a
+									// plain projection of it as its accessible name (KB-59 D2).
+									h(MarkdownBody, { text: question.text, t }),
 									h('input', {
 										className: 'kb-input',
 										placeholder: t('execution.answerPlaceholder'),
 										value: safeString(answers[index]),
-										'aria-label': question.text,
+										'aria-label': markdownPlainLabel(question.text),
 										onChange: (event) => setAnswer(index, event.target.value),
 									}),
 								),
@@ -3742,7 +6151,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									{ key: need.id || index, className: 'kb-waitNeed' },
 									h('input', { type: 'checkbox', checked: grants[index] === true, onChange: () => toggleGrant(index) }),
 									h('span', { className: 'kb-waitKind' }, needKindLabel(need.kind, t)),
-									h('span', null, need.text),
+									// KB-59: each need statement renders as Markdown; the grant
+									// checkbox, its wrapper and the Send rules stay untouched.
+									h(MarkdownBody, { text: need.text, t }),
 								),
 							)
 						: null,
@@ -3780,7 +6191,13 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					)
 				}
 				if (execution && status === 'done') {
-					parts.push(execution.report ? h('div', { className: 'kb-execReport' }, execution.report) : h('span', { className: 'kb-execHint' }, t('execution.done')))
+					// KB-59: the stored report is agent-written Markdown rendered inside the
+					// unchanged 120px scroll wrapper, so the panel buttons stay reachable.
+					parts.push(
+						execution.report
+							? h('div', { className: 'kb-execReport' }, h(MarkdownBody, { text: execution.report, t }))
+							: h('span', { className: 'kb-execHint' }, t('execution.done')),
+					)
 				}
 				if (execution && (status === 'failed' || status === 'cancelled') && execution.error) {
 					parts.push(h('span', { className: 'kb-hint kb-hint--error' }, execution.error))
@@ -3844,7 +6261,11 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				{ className: 'kb-execPanel' },
 				head,
 				body,
-				execution && execution.report && status !== 'done' ? h('div', { className: 'kb-execReport' }, execution.report) : null,
+				// KB-59: below the panel body the non-done report renders the same way,
+				// inside the same 120px scroll wrapper.
+				execution && execution.report && status !== 'done'
+					? h('div', { className: 'kb-execReport' }, h(MarkdownBody, { text: execution.report, t }))
+					: null,
 			)
 		}
 
@@ -3853,7 +6274,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		// ------------------------------------------------------------------
 
 		function TicketDrawer(props) {
-			const { t, ticket, team, paused, pending, act, notify, roleName, openSession, onClose, onRun, onCancelExecution, onAnswerExecution } = props
+			const { t, ticket, team, thoughts, deletedThoughtIds, paused, pending, act, notify, roleName, openSession, onOpenThought, onClose, onRun, onCancelExecution, onAnswerExecution, children, onOpenTicket } = props
 			const closeRef = useRef(null)
 			const [draftTitle, setDraftTitle] = useState(safeString(ticket.title))
 			const [draftDescription, setDraftDescription] = useState(safeString(ticket.description))
@@ -3863,6 +6284,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const [commentDraft, setCommentDraft] = useState('')
 			const [deleteArmed, setDeleteArmed] = useState(false)
 			const [savedTick, setSavedTick] = useState(0)
+			// KB-58: the description/PRD opens as a rendered read view; `edit` is
+			// today's textarea and `preview` renders the unsaved draft.
+			const [descriptionMode, setDescriptionMode] = useState('read')
 
 			useEscape(true, onClose)
 			useFocusOnOpen(true, closeRef)
@@ -3878,6 +6302,29 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			}, [deleteArmed])
 
 			const isPaused = paused === true
+			const isEpic = ticket.type === 'epic'
+			// KB-58: the read view renders the persisted source; Preview renders the
+			// live draft so unsaved text is never hidden or discarded.
+			const storedDescription = safeString(ticket.description)
+			const descriptionLabelText = isEpic ? t('detail.epicPrd') : t('detail.description')
+			const descriptionEmptyText = isEpic ? t('detail.epicPrdEmpty') : t('detail.descriptionEmpty')
+			const toggleDescriptionMode = (mode) => {
+				if (isPaused) return
+				setDescriptionMode((current) => (current === mode ? 'read' : mode))
+			}
+			const renderDescriptionRead = (source) => {
+				if (safeString(source).trim() === '') {
+					return h('div', { className: 'kb-hint kb-descEmpty', 'data-description-empty': 'true' }, descriptionEmptyText)
+				}
+				return h(MarkdownBody, { text: source, label: descriptionLabelText, t })
+			}
+			const childTickets = safeArray(children).filter((child) => child && typeof child.id === 'string')
+			const childStatus = (child) => {
+				if (child.blocked === true) return { label: t('card.blocked'), cls: 'error' }
+				const status = executionStatusOf(child)
+				if (status) return { label: executionChipLabel(status, t), cls: status === 'running' ? 'brand' : 'idle' }
+				return { label: t('status.idle'), cls: 'idle' }
+			}
 			const owner = ticket.owner && typeof ticket.owner === 'object' ? ticket.owner : null
 			const checklist = safeArray(ticket.checklist).filter((item) => item && typeof item.id === 'string')
 			const doneCount = checklist.filter((item) => item.done === true).length
@@ -3890,7 +6337,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				.slice(-20)
 				.reverse()
 			const columnIndex = COLUMNS.indexOf(ticket.column)
-			const canMove = !isPaused && ticket.blocked !== true
+			// An EPIC never moves out of Backlog; the drawer disables the controls.
+			const canMove = !isPaused && ticket.blocked !== true && !isEpic
 			const movePending = (pending['move:' + ticket.id] || 0) > 0
 			const blockPending = (pending['block:' + ticket.id] || 0) > 0
 			const deletePending = (pending['delete:' + ticket.id] || 0) > 0
@@ -4039,6 +6487,37 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				})
 			}
 
+			// KB-5: the thought this ticket came from. `deletedThoughtIds` separates a
+			// soft-deleted thought ("Thought deleted") from one outside the 50-row window.
+			const thoughtId = safeString(ticket.thoughtId)
+			const linkedThought = thoughtId ? safeArray(thoughts).find((thought) => thought && thought.id === thoughtId) ?? null : null
+			const thoughtDeleted = thoughtId !== '' && !linkedThought && safeArray(deletedThoughtIds).indexOf(thoughtId) !== -1
+			const thoughtChip = thoughtId === ''
+				? null
+				: h(
+						'div',
+						{ className: 'kb-ticketThoughtRow' },
+						h('span', { className: 'kb-ticketThoughtLabel' }, t('thought.ticketChip')),
+						thoughtDeleted
+							? h('span', { className: 'kb-ticketThoughtDeleted' }, t('thought.deletedFallback'))
+							: linkedThought
+								? h(
+										'button',
+										{
+											type: 'button',
+											className: 'kb-thoughtChip',
+											title: thoughtStatusLabel(linkedThought.status, t),
+											onClick: () => {
+												if (linkedThought.sessionId) openSession(linkedThought.sessionId)
+												else onOpenThought(linkedThought.id)
+											},
+										},
+										thoughtId,
+								  )
+								: h('span', { className: 'kb-thoughtChip', title: t('thought.unavailable') }, thoughtId),
+						linkedThought ? h('span', { className: 'kb-ticketThoughtLabel' }, thoughtStatusLabel(linkedThought.status, t)) : null,
+					  )
+
 			const prioritySelect = h(
 				'select',
 				{
@@ -4091,9 +6570,10 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					h(
 						'div',
 						{ className: 'kb-drawerBody' },
+						thoughtChip,
 						h(
 							'div',
-							{ className: 'kb-section' },
+							{ className: 'kb-section', 'data-description-section': 'true' },
 							h('input', {
 								className: 'kb-titleInput',
 								value: draftTitle,
@@ -4109,17 +6589,104 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									}
 								},
 							}),
-							h('textarea', {
-								className: 'kb-description',
-								value: draftDescription,
-								disabled: isPaused,
-								placeholder: t('detail.descriptionPlaceholder'),
-								'aria-label': t('detail.description'),
-								rows: 3,
-								onChange: (event) => setDraftDescription(event.target.value),
-								onBlur: commitDescription,
-							}),
+							h(
+								'div',
+								{ className: 'kb-descHead' },
+								isEpic ? h('div', { className: 'kb-fieldLabel' }, t('detail.epicPrd')) : null,
+								h(
+									'div',
+									{ className: 'kb-descModes', role: 'group', 'aria-label': t('detail.descriptionMode') },
+									h(
+										'button',
+										{
+											type: 'button',
+											className: 'kb-btn kb-btn--sm kb-descMode',
+											'aria-pressed': descriptionMode === 'edit' ? 'true' : 'false',
+											disabled: isPaused,
+											onClick: () => toggleDescriptionMode('edit'),
+										},
+										t('detail.edit'),
+									),
+									h(
+										'button',
+										{
+											type: 'button',
+											className: 'kb-btn kb-btn--sm kb-descMode',
+											'aria-pressed': descriptionMode === 'preview' ? 'true' : 'false',
+											disabled: isPaused,
+											onClick: () => toggleDescriptionMode('preview'),
+										},
+										t('detail.preview'),
+									),
+								),
+							),
+							isEpic ? h('div', { className: 'kb-hint' }, t('detail.epicPrdHint')) : null,
+							descriptionMode === 'edit'
+								? h('textarea', {
+										className: 'kb-description',
+										value: draftDescription,
+										disabled: isPaused,
+										placeholder: isEpic ? t('detail.epicPrdHint') : t('detail.descriptionPlaceholder'),
+										'aria-label': isEpic ? t('detail.epicPrd') : t('detail.description'),
+										rows: isEpic ? 6 : 3,
+										onChange: (event) => setDraftDescription(event.target.value),
+										onBlur: commitDescription,
+									})
+								: h(
+										'div',
+										{ className: 'kb-descRead', 'data-description-mode': descriptionMode },
+										renderDescriptionRead(descriptionMode === 'preview' ? draftDescription : storedDescription),
+									),
 						),
+						isEpic
+							? h(
+									'div',
+									{ className: 'kb-section', 'data-epic-children': 'true' },
+									h(SectionHead, { title: t('detail.children'), count: childTickets.length }),
+									childTickets.length === 0
+										? h(
+												'div',
+												{ className: 'kb-emptyLine kb-childrenEmpty' },
+												h('div', null, t('detail.childrenEmpty')),
+												h('div', { className: 'kb-hint' }, t('detail.childrenEmptyHint')),
+											)
+										: h(
+												'div',
+												{ className: 'kb-childList' },
+												childTickets.map((child) => {
+													const status = childStatus(child)
+													return h(
+														'button',
+														{
+															key: child.id,
+															type: 'button',
+															className: 'kb-childRow',
+															'data-child-id': child.id,
+															'data-column': safeString(child.column),
+															'data-status': status.label,
+															'aria-label': t('card.open', { id: child.id }),
+															onClick: () => {
+																if (typeof onOpenTicket === 'function') onOpenTicket(child.id)
+															},
+														},
+														h('span', { className: 'kb-childId' }, safeString(child.id)),
+														h('span', { className: 'kb-childTitle', title: safeString(child.title) }, safeString(child.title)),
+														h(
+															'span',
+															{ className: 'kb-chip kb-chip--idle' },
+															h('span', { className: 'kb-dot kb-dot--' + safeString(child.column) }),
+															h('span', { className: 'kb-chipText' }, t('columns.' + safeString(child.column))),
+														),
+														h(
+															'span',
+															{ className: 'kb-chip kb-chip--' + status.cls, title: t('detail.childStatus') + ': ' + status.label },
+															h('span', { className: 'kb-chipText' }, status.label),
+														),
+													)
+												}),
+											),
+								)
+							: null,
 						h(ExecutionPanel, {
 							t,
 							ticket,
@@ -4160,8 +6727,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							),
 							h(
 								'div',
-								{ className: classNames('kb-hint', ticket.blocked === true && 'kb-hint--error') },
-								t('detail.moveHint'),
+								{ className: classNames('kb-hint', ticket.blocked === true && 'kb-hint--error', isEpic && 'kb-hint--epic') },
+								isEpic ? t('detail.epicLocked') : t('detail.moveHint'),
 							),
 						),
 						h(
@@ -4378,7 +6945,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 												h('span', { className: 'kb-commentAuthor' }, safeString(comment.author) || 'agent'),
 												h('span', null, formatAge(comment.at, t)),
 											),
-											h('div', { className: 'kb-commentText' }, comment.text),
+											// KB-59: comment bodies are agent-written Markdown; the
+											// author, relative time and newest-first order stay as-is.
+											h('div', { className: 'kb-commentText' }, h(MarkdownBody, { text: comment.text, t })),
 										),
 									)
 								: h('div', { className: 'kb-emptyLine' }, t('detail.commentsEmpty')),
@@ -4488,34 +7057,608 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		// Thought intake (KB-1): Speak-a-thought dialog + Thoughts drawer
 		// ------------------------------------------------------------------
 
-		const THOUGHT_STATUSES = ['recorded', 'working', 'done', 'failed']
+		// KB-5 additive statuses: `queued` (captured while paused) and `cancelled`.
+		const THOUGHT_STATUSES = ['recorded', 'working', 'done', 'failed', 'queued', 'cancelled']
 
 		/** Localized status text; status is always conveyed by words, never colour alone. */
 		function thoughtStatusLabel(status, t) {
 			const value = safeString(status)
-			return t('thought.status.' + (THOUGHT_STATUSES.indexOf(value) === -1 ? 'recorded' : value))
+			return t('thought.status.' + (THOUGHT_STATUSES.indexOf(value) === -1 ? 'unknown' : value))
+		}
+
+		// ------------------------------------------------------------------
+		// Voice dictation (KB-2)
+		//
+		// The installed voice bundle owns recognition and exposes an optional
+		// experimental `remote.speech` namespace with `catalog()` and
+		// `transcribe({ audioBase64, providerId, language })`. It has no
+		// streaming segment API and no exported capture control, so this dialog
+		// records one fragment itself, sends that one complete 16 kHz mono PCM16
+		// WAV on stop and appends the single final transcript. No partial text is
+		// invented and nothing submits without the user pressing Send.
+		// ------------------------------------------------------------------
+
+		const THOUGHT_MAX_LENGTH = 4000
+		const VOICE_DEFAULT_MAX_SECONDS = 120
+		const VOICE_DEFAULT_MAX_BYTES = 4 * 1024 * 1024
+		const VOICE_READY_PHASES = ['ready', 'standby', 'waking']
+
+		function initialVoiceState() {
+			return { phase: 'checking', pressed: false, reason: '', error: '', announcement: '', elapsedSeconds: 0, lastTranscript: '' }
+		}
+
+		/** Append one final transcript after existing text without overwriting it. */
+		function appendTranscript(current, transcript, maxLength) {
+			const base = safeString(current)
+			const extra = safeString(transcript)
+				.replace(/\s+/g, ' ')
+				.trim()
+			if (extra === '') return base
+			const next = base === '' ? extra : /\s$/.test(base) ? base + extra : base + ' ' + extra
+			const limit = safeNumber(maxLength, THOUGHT_MAX_LENGTH)
+			return next.length > limit ? next.slice(0, limit) : next
+		}
+
+		/** Encode mono float samples as the canonical 16 kHz PCM16 WAV the bundle accepts. */
+		function encodeWave(samples) {
+			const bytes = new Uint8Array(44 + samples.length * 2)
+			const view = new DataView(bytes.buffer)
+			const text = (at, value) => {
+				for (let index = 0; index < value.length; index += 1) bytes[at + index] = value.charCodeAt(index)
+			}
+			text(0, 'RIFF')
+			view.setUint32(4, bytes.length - 8, true)
+			text(8, 'WAVE')
+			text(12, 'fmt ')
+			view.setUint32(16, 16, true)
+			view.setUint16(20, 1, true)
+			view.setUint16(22, 1, true)
+			view.setUint32(24, 16000, true)
+			view.setUint32(28, 32000, true)
+			view.setUint16(32, 2, true)
+			view.setUint16(34, 16, true)
+			text(36, 'data')
+			view.setUint32(40, samples.length * 2, true)
+			for (let index = 0; index < samples.length; index += 1) {
+				const sample = Math.max(-1, Math.min(1, samples[index]))
+				view.setInt16(44 + index * 2, Math.round(sample * (sample < 0 ? 32768 : 32767)), true)
+			}
+			return bytes
+		}
+
+		/** Base64 for the bundle's existing JSON Remote carrier (no data-URL prefix). */
+		function waveBase64(bytes) {
+			let text = ''
+			for (let index = 0; index < bytes.length; index += 8192) text += String.fromCharCode(...bytes.subarray(index, index + 8192))
+			return btoa(text)
+		}
+
+		/** Map a capture failure onto the dialog's localized error states. */
+		function captureFailureKind(error) {
+			const name = error && typeof error === 'object' ? safeString(error.name) : ''
+			if (name === 'NotAllowedError' || name === 'SecurityError') return 'permission'
+			if (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'NotReadableError') return 'device'
+			return 'capture'
+		}
+
+		function voiceErrorText(kind, t, catalog) {
+			const keys = {
+				permission: 'thought.voice.errorPermission',
+				device: 'thought.voice.errorDevice',
+				capture: 'thought.voice.errorCapture',
+				transcribe: 'thought.voice.errorTranscribe',
+				empty: 'thought.voice.errorEmpty',
+				'too-long': 'thought.voice.errorTooLong',
+			}
+			const key = keys[kind] || keys.capture
+			const seconds = safeNumber(catalog && catalog.maxDurationSeconds, VOICE_DEFAULT_MAX_SECONDS)
+			return t(key, { seconds })
+		}
+
+		/** Read the bundle's `catalog()` envelope into the dialog's capability state. */
+		function readVoiceCatalog(envelope) {
+			if (!envelope || envelope.ok !== true || !envelope.value || typeof envelope.value !== 'object') {
+				return { available: false, ready: false, reason: 'service', phase: '' }
+			}
+			const value = envelope.value
+			const providers = safeArray(value.providers)
+			const selection = value.selection && typeof value.selection === 'object' ? value.selection : {}
+			const providerId = safeString(selection.providerId)
+			const language = safeString(selection.language)
+			const provider = providers.find((item) => item && item.id === providerId) || null
+			const phase =
+				provider && provider.preparation && typeof provider.preparation.phase === 'string' ? provider.preparation.phase : 'unprepared'
+			return {
+				available: true,
+				ready: provider !== null && VOICE_READY_PHASES.indexOf(phase) !== -1,
+				reason: 'unready',
+				phase,
+				providerId,
+				language,
+				maxDurationSeconds: safeNumber(value.maxDurationSeconds, VOICE_DEFAULT_MAX_SECONDS),
+				maxAudioBytes: safeNumber(value.maxAudioBytes, VOICE_DEFAULT_MAX_BYTES),
+			}
+		}
+
+		/**
+		 * One microphone recording, released on stop/dispose. The bundle's own
+		 * capture control is composer-scoped and unexported, so the dialog keeps
+		 * this small capture layer and hands the resulting WAV to the bundle.
+		 */
+		function createMicrophoneCapture() {
+			let stream = null
+			let context = null
+			let recorder = null
+			let chunks = []
+			let cancelled = false
+			let released = false
+
+			const release = async () => {
+				if (released) return
+				released = true
+				try {
+					if (recorder && recorder.state !== 'inactive') recorder.stop()
+				} catch (error) {
+					// recorder teardown is best-effort
+				}
+				if (stream) {
+					for (const track of stream.getTracks()) {
+						try {
+							track.stop()
+						} catch (error) {
+							// track teardown is best-effort
+						}
+					}
+				}
+				stream = null
+				const closing = context
+				context = null
+				if (closing && closing.state !== 'closed') {
+					try {
+						await closing.close()
+					} catch (error) {
+						// audio-context teardown is best-effort
+					}
+				}
+				chunks = []
+			}
+
+			return {
+				async start(onEnded) {
+					const devices = typeof navigator !== 'undefined' ? navigator.mediaDevices : null
+					if (!devices || typeof devices.getUserMedia !== 'function' || typeof MediaRecorder === 'undefined') {
+						const error = new Error('microphone capture is unavailable')
+						error.name = 'NotSupportedError'
+						throw error
+					}
+					const acquired = await devices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false })
+					if (cancelled) {
+						for (const track of acquired.getTracks()) track.stop()
+						const error = new Error('capture cancelled')
+						error.name = 'AbortError'
+						throw error
+					}
+					stream = acquired
+					const AudioContextImpl = typeof AudioContext === 'function' ? AudioContext : null
+					context = AudioContextImpl ? new AudioContextImpl() : null
+					for (const track of acquired.getTracks()) {
+						track.addEventListener('ended', () => {
+							if (!cancelled && !released && typeof onEnded === 'function') onEnded()
+						})
+					}
+					recorder = new MediaRecorder(acquired)
+					chunks = []
+					recorder.ondataavailable = (event) => {
+						if (event.data && event.data.size > 0) chunks.push(event.data)
+					}
+					recorder.onerror = () => {
+						if (!cancelled && !released && typeof onEnded === 'function') onEnded()
+					}
+					recorder.start()
+				},
+				async stop(maxDurationSeconds) {
+					const active = recorder
+					const audioContext = context
+					if (!active || !audioContext || active.state !== 'recording') {
+						await release()
+						return null
+					}
+					try {
+						await new Promise((resolve, reject) => {
+							active.onstop = () => resolve()
+							active.onerror = () => reject(new Error('recording failed'))
+							active.stop()
+						})
+						if (stream) for (const track of stream.getTracks()) track.stop()
+						const blob = new Blob(chunks, { type: active.mimeType })
+						if (blob.size === 0) return null
+						const decoded = await audioContext.decodeAudioData(await blob.arrayBuffer())
+						const seconds = Math.min(decoded.duration, safeNumber(maxDurationSeconds, VOICE_DEFAULT_MAX_SECONDS))
+						const frames = Math.max(1, Math.floor(seconds * 16000))
+						const offline = new OfflineAudioContext(1, frames, 16000)
+						const source = offline.createBufferSource()
+						source.buffer = decoded
+						source.connect(offline.destination)
+						source.start()
+						const rendered = await offline.startRendering()
+						return encodeWave(rendered.getChannelData(0))
+					} finally {
+						await release()
+					}
+				},
+				async dispose() {
+					cancelled = true
+					await release()
+				},
+			}
+		}
+
+		/**
+		 * One dialog-scoped dictation session: capability check, capture start,
+		 * one-stop transcription, submit flush and teardown. Kept independent of
+		 * React so the dependency-free client harness can drive it with a fake
+		 * bundle double, fake capture and injected timers.
+		 */
+		function createVoiceEngine(options) {
+			const opts = options && typeof options === 'object' ? options : {}
+			const getSpeech = typeof opts.getSpeech === 'function' ? opts.getSpeech : () => null
+			const t = typeof opts.t === 'function' ? opts.t : (key) => key
+			const getText = typeof opts.getText === 'function' ? opts.getText : () => ''
+			const onText = typeof opts.onText === 'function' ? opts.onText : () => {}
+			const onState = typeof opts.onState === 'function' ? opts.onState : () => {}
+			const now = typeof opts.now === 'function' ? opts.now : () => Date.now()
+			const captureFactory = typeof opts.captureFactory === 'function' ? opts.captureFactory : createMicrophoneCapture
+			const timers =
+				opts.timers && typeof opts.timers === 'object'
+					? opts.timers
+					: {
+							setTimeout: (fn, ms) => setTimeout(fn, ms),
+							clearTimeout: (id) => clearTimeout(id),
+							setInterval: (fn, ms) => setInterval(fn, ms),
+							clearInterval: (id) => clearInterval(id),
+					  }
+
+			let state = initialVoiceState()
+			let speech = null
+			let catalog = null
+			let capture = null
+			let generation = 0
+			let intervalId = null
+			let limitId = null
+			let startedAt = 0
+			let transcribing = null
+			let abort = null
+			let disposed = false
+
+			const emit = (patch) => {
+				state = { ...state, ...patch }
+				if (disposed) return
+				try {
+					onState(state)
+				} catch (error) {
+					// a render error must not break capture cleanup
+				}
+			}
+
+			const clearTimers = () => {
+				if (intervalId !== null) {
+					timers.clearInterval(intervalId)
+					intervalId = null
+				}
+				if (limitId !== null) {
+					timers.clearTimeout(limitId)
+					limitId = null
+				}
+			}
+
+			const dropCapture = async (mic) => {
+				if (!mic) return
+				try {
+					await mic.dispose()
+				} catch (error) {
+					// capture disposal is best-effort
+				}
+			}
+
+			const schedule = (active) => {
+				startedAt = now()
+				intervalId = timers.setInterval(() => {
+					if (disposed || active !== generation || state.phase !== 'recording') return
+					emit({ elapsedSeconds: Math.max(0, Math.floor((now() - startedAt) / 1000)) })
+				}, 1000)
+				const seconds = Math.max(1, safeNumber(catalog && catalog.maxDurationSeconds, VOICE_DEFAULT_MAX_SECONDS))
+				limitId = timers.setTimeout(() => {
+					if (disposed || active !== generation || state.phase !== 'recording') return
+					void stop(false)
+				}, seconds * 1000)
+			}
+
+			function onCaptureEnded(active) {
+				if (disposed || active !== generation) return
+				if (state.phase !== 'recording' && state.phase !== 'requesting') return
+				const mic = capture
+				capture = null
+				generation += 1
+				clearTimers()
+				void dropCapture(mic)
+				emit({ phase: 'error', pressed: false, error: 'capture', announcement: voiceErrorText('capture', t, catalog), elapsedSeconds: 0 })
+			}
+
+			async function start() {
+				if (disposed || !catalog || !catalog.ready) return
+				if (state.phase === 'requesting' || state.phase === 'recording' || state.phase === 'transcribing') return
+				const active = ++generation
+				emit({ phase: 'requesting', pressed: true, reason: '', error: '', announcement: t('thought.voice.announceRequesting'), elapsedSeconds: 0 })
+				abort = new AbortController()
+				const mic = captureFactory()
+				capture = mic
+				try {
+					await mic.start(() => onCaptureEnded(active))
+				} catch (error) {
+					if (capture === mic) capture = null
+					await dropCapture(mic)
+					if (disposed || active !== generation) return
+					const kind = captureFailureKind(error)
+					emit({ phase: 'error', pressed: false, error: kind, announcement: voiceErrorText(kind, t, catalog), elapsedSeconds: 0 })
+					return
+				}
+				if (disposed || active !== generation) {
+					await dropCapture(mic)
+					return
+				}
+				emit({ phase: 'recording', pressed: true, error: '', announcement: t('thought.voice.announceListening'), elapsedSeconds: 0 })
+				schedule(active)
+			}
+
+			async function stop(forSubmit) {
+				if (disposed) return { ok: false, cancelled: true, text: getText() }
+				if (state.phase === 'transcribing' && transcribing) return transcribing
+				if (state.phase !== 'recording' && state.phase !== 'requesting') {
+					return { ok: true, empty: true, text: getText() }
+				}
+				const active = ++generation
+				const mic = capture
+				capture = null
+				clearTimers()
+				if (!mic) {
+					emit({ phase: 'idle', pressed: false, elapsedSeconds: 0 })
+					return { ok: true, empty: true, text: getText() }
+				}
+				transcribing = (async () => {
+					try {
+						emit({ phase: 'transcribing', pressed: false, error: '', announcement: t('thought.voice.announceTranscribing'), elapsedSeconds: 0 })
+						let bytes = null
+						try {
+							bytes = await mic.stop(catalog.maxDurationSeconds)
+						} catch (error) {
+							bytes = null
+						}
+						if (disposed || active !== generation) return { ok: false, cancelled: true, text: getText() }
+						if (!bytes || bytes.length === 0) {
+							if (forSubmit) {
+								emit({ phase: 'idle', pressed: false, elapsedSeconds: 0 })
+								return { ok: true, empty: true, text: getText() }
+							}
+							emit({ phase: 'error', pressed: false, error: 'empty', announcement: voiceErrorText('empty', t, catalog), elapsedSeconds: 0 })
+							return { ok: false, empty: true, text: getText() }
+						}
+						if (bytes.length > safeNumber(catalog.maxAudioBytes, VOICE_DEFAULT_MAX_BYTES)) {
+							emit({ phase: 'error', pressed: false, error: 'too-long', announcement: voiceErrorText('too-long', t, catalog), elapsedSeconds: 0 })
+							return { ok: false, text: getText() }
+						}
+						let envelope = null
+						try {
+							envelope = await speech.transcribe(
+								{ audioBase64: waveBase64(bytes), providerId: catalog.providerId, language: catalog.language },
+								abort ? abort.signal : undefined,
+							)
+						} catch (error) {
+							envelope = null
+						}
+						if (disposed || active !== generation) return { ok: false, cancelled: true, text: getText() }
+						if (!envelope || envelope.ok !== true || !envelope.value || typeof envelope.value !== 'object') {
+							emit({ phase: 'error', pressed: false, error: 'transcribe', announcement: voiceErrorText('transcribe', t, catalog), elapsedSeconds: 0 })
+							return { ok: false, text: getText() }
+						}
+						const transcript = safeString(envelope.value.text)
+						if (transcript === '') {
+							if (forSubmit) {
+								emit({ phase: 'idle', pressed: false, elapsedSeconds: 0 })
+								return { ok: true, empty: true, text: getText() }
+							}
+							emit({ phase: 'error', pressed: false, error: 'empty', announcement: voiceErrorText('empty', t, catalog), elapsedSeconds: 0 })
+							return { ok: false, empty: true, text: getText() }
+						}
+						const next = appendTranscript(getText(), transcript, THOUGHT_MAX_LENGTH)
+						if (next !== getText()) onText(next)
+						emit({
+							phase: 'idle',
+							pressed: false,
+							error: '',
+							lastTranscript: transcript,
+							announcement: t('thought.voice.announceAdded', { text: transcript }),
+							elapsedSeconds: 0,
+						})
+						return { ok: true, text: next }
+					} finally {
+						await dropCapture(mic)
+						if (!disposed && active === generation) transcribing = null
+					}
+				})()
+				return transcribing
+			}
+
+			function toggle() {
+				if (disposed) return Promise.resolve()
+				if (state.phase === 'recording') return stop(false)
+				if (state.phase === 'idle' || state.phase === 'error') return start()
+				return Promise.resolve()
+			}
+
+			async function submitFlush() {
+				if (disposed) return { ok: false, cancelled: true, text: getText() }
+				if (state.phase === 'recording') {
+					const result = await stop(true)
+					return { ok: result.ok === true, text: typeof result.text === 'string' ? result.text : getText() }
+				}
+				if (state.phase === 'transcribing' && transcribing) {
+					await transcribing
+					return { ok: true, text: getText() }
+				}
+				if (state.phase === 'requesting') {
+					const active = ++generation
+					const mic = capture
+					capture = null
+					clearTimers()
+					await dropCapture(mic)
+					if (!disposed && active === generation) emit({ phase: 'idle', pressed: false, elapsedSeconds: 0 })
+					return { ok: true, text: getText() }
+				}
+				return { ok: true, text: getText() }
+			}
+
+			async function init() {
+				if (disposed) return state
+				emit({ phase: 'checking', pressed: false, reason: '', error: '', announcement: t('thought.voice.announceChecking'), elapsedSeconds: 0 })
+				const remote = getSpeech()
+				if (!remote || typeof remote.catalog !== 'function' || typeof remote.transcribe !== 'function') {
+					emit({ phase: 'unavailable', pressed: false, reason: 'absent', announcement: t('thought.voice.unavailable'), elapsedSeconds: 0 })
+					return state
+				}
+				let envelope = null
+				try {
+					envelope = await remote.catalog()
+				} catch (error) {
+					envelope = null
+				}
+				if (disposed) return state
+				const reading = readVoiceCatalog(envelope)
+				if (!reading.available) {
+					emit({ phase: 'unavailable', pressed: false, reason: 'service', announcement: t('thought.voice.unavailable'), elapsedSeconds: 0 })
+					return state
+				}
+				if (!reading.ready) {
+					emit({ phase: 'unavailable', pressed: false, reason: 'unready', announcement: t('thought.voice.unready'), elapsedSeconds: 0 })
+					return state
+				}
+				speech = remote
+				catalog = reading
+				await start()
+				return state
+			}
+
+			function dispose() {
+				if (disposed) return
+				disposed = true
+				generation += 1
+				clearTimers()
+				if (abort) {
+					try {
+						abort.abort()
+					} catch (error) {
+						// abort is best-effort
+					}
+					abort = null
+				}
+				const mic = capture
+				capture = null
+				transcribing = null
+				void dropCapture(mic)
+			}
+
+			return { init, start, stop, toggle, submitFlush, dispose, getState: () => state }
+		}
+
+		/** Visible dictation status; an empty string is the deliberate quiet off state. */
+		function voiceStatusText(voice, t) {
+			const state = voice && typeof voice === 'object' ? voice : initialVoiceState()
+			if (state.phase === 'recording') return t('thought.voice.listening', { seconds: safeNumber(state.elapsedSeconds, 0) })
+			if (state.phase === 'requesting') return t('thought.voice.requesting')
+			if (state.phase === 'checking') return t('thought.voice.checking')
+			if (state.phase === 'transcribing') return t('thought.voice.transcribing')
+			if (state.phase === 'unavailable' || state.phase === 'error') return safeString(state.announcement)
+			return ''
+		}
+
+		function voiceToggleLabel(voice, t) {
+			const state = voice && typeof voice === 'object' ? voice : initialVoiceState()
+			if (state.phase === 'recording') return t('thought.voice.stop')
+			if (state.phase === 'requesting') return t('thought.voice.requesting')
+			if (state.phase === 'checking') return t('thought.voice.checking')
+			if (state.phase === 'transcribing') return t('thought.voice.transcribing')
+			return t('thought.voice.start')
 		}
 
 		function ThoughtDialog(props) {
-			const { t, onSubmit, onClose } = props
+			const { t, onSubmit, onClose, getSpeech } = props
 			const textareaRef = useRef(null)
 			const dialogRef = useRef(null)
+			const engineRef = useRef(null)
+			const textRef = useRef('')
+			const submittingRef = useRef(false)
 			const [text, setText] = useState('')
 			const [submitting, setSubmitting] = useState(false)
+			const [voice, setVoice] = useState(initialVoiceState)
 
 			useEscape(true, onClose)
 			useFocusOnOpen(true, textareaRef)
 
+			// One dictation session per open dialog. Cleanup always releases the mic,
+			// even when the dialog closes through Escape or the overlay.
+			useEffect(() => {
+				const engine = createVoiceEngine({
+					getSpeech: typeof getSpeech === 'function' ? getSpeech : () => null,
+					t,
+					getText: () => textRef.current,
+					onText: (next) => setText(next),
+					onState: (next) => setVoice(next),
+				})
+				engineRef.current = engine
+				void engine.init()
+				return () => {
+					engineRef.current = null
+					engine.dispose()
+				}
+			}, [])
+
+			useEffect(() => {
+				textRef.current = text
+			}, [text])
+
 			const trimmed = text.trim()
-			const canSend = trimmed !== '' && !submitting
+			const voiceBusy = voice.phase === 'checking' || voice.phase === 'requesting' || voice.phase === 'transcribing'
+			const canSend = trimmed !== '' && !submitting && voice.phase !== 'transcribing'
+			const toggleDisabled = submitting || voiceBusy || voice.phase === 'unavailable'
+			const toggleLabel = voiceToggleLabel(voice, t)
+			const statusText = voiceStatusText(voice, t)
+			const showingError = voice.phase === 'error'
 
 			const submit = async () => {
-				if (!canSend) return
+				if (!canSend || submittingRef.current) return
+				submittingRef.current = true
 				setSubmitting(true)
-				const result = await onSubmit(trimmed)
-				setSubmitting(false)
-				// A failed submit keeps the dialog (and the typed text) open.
-				if (result && result.ok) onClose()
+				let keepOpen = true
+				try {
+					// A stop-to-transcribe flush finalizes the pending fragment first, so a
+					// single Send either submits the reviewed text or fails closed.
+					let nextText = text
+					const engine = engineRef.current
+					if (engine) {
+						const flushed = await engine.submitFlush()
+						if (!flushed || flushed.ok !== true) return
+						if (typeof flushed.text === 'string') nextText = flushed.text
+					}
+					const finalText = nextText.trim()
+					if (finalText === '') return
+					const result = await onSubmit(finalText)
+					if (result && result.ok) {
+						keepOpen = false
+						onClose()
+					}
+				} finally {
+					submittingRef.current = false
+					if (keepOpen) setSubmitting(false)
+				}
 			}
 
 			// Trapped-lite: Tab cycles inside the dialog, Escape closes and focus restores.
@@ -4536,6 +7679,12 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					event.preventDefault()
 					first.focus()
 				}
+			}
+
+			const toggleDictation = () => {
+				const engine = engineRef.current
+				if (!engine) return
+				void engine.toggle()
 			}
 
 			return h(
@@ -4581,19 +7730,52 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 								className: 'kb-textarea',
 								value: text,
 								rows: 6,
-								maxLength: 4000,
+								maxLength: THOUGHT_MAX_LENGTH,
 								placeholder: t('thought.placeholder'),
 								'aria-label': t('thought.field'),
 								onChange: (event) => setText(event.target.value),
 								onKeyDown: (event) => {
-								if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-									event.preventDefault()
-									void submit()
-								}
-							},
+									if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+										event.preventDefault()
+										void submit()
+									}
+								},
 							}),
-							text.length > 3600 ? h('span', { className: 'kb-thoughtCounter' }, text.length + '/4000') : null,
+							text.length > 3600
+								? h('span', { className: 'kb-thoughtCounter' }, text.length + '/' + THOUGHT_MAX_LENGTH)
+								: null,
 						),
+						h(
+							'div',
+							{ className: 'kb-thoughtVoice' },
+							h(
+								Button,
+								{
+									className: 'kb-thoughtVoiceToggle',
+									variant: voice.phase === 'recording' ? 'primary' : 'ghost',
+									size: 'sm',
+									icon: h(IconMic, { size: 13 }),
+									pressed: voice.pressed === true,
+									disabled: toggleDisabled,
+									title: toggleLabel,
+									'aria-label': toggleLabel,
+									onClick: toggleDictation,
+								},
+								toggleLabel,
+							),
+							voice.phase === 'recording' ? h('span', { className: 'kb-thoughtVoiceDot', 'aria-hidden': 'true' }) : null,
+							statusText
+								? h(
+										'span',
+										{
+											className: classNames('kb-thoughtVoiceState', showingError && 'kb-thoughtVoiceState--error'),
+											'aria-hidden': 'true',
+										},
+										statusText,
+								  )
+								: null,
+						),
+						h('span', { className: 'kb-srOnly', role: 'status', 'aria-live': 'polite' }, safeString(voice.announcement)),
 					),
 					h(
 						'div',
@@ -4614,33 +7796,92 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			)
 		}
 
+		/** Best-effort timeline: the audit when present, else a derived two-step view. */
+		function thoughtTimelineEntries(thought) {
+			const audit = safeArray(thought.audit).filter((entry) => entry && typeof entry === 'object' && safeNumber(entry.at, 0) > 0)
+			if (audit.length > 0) {
+				return audit.slice().sort((left, right) => safeNumber(left.at, 0) - safeNumber(right.at, 0))
+			}
+			const createdAt = safeNumber(thought.createdAt, 0)
+			const status = safeString(thought.status)
+			const derived = createdAt > 0 ? [{ at: createdAt, type: 'status', to: 'recorded' }] : []
+			if (status && status !== 'recorded' && safeNumber(thought.updatedAt, 0) > createdAt) {
+				derived.push({ at: safeNumber(thought.updatedAt, 0), type: 'status', to: status })
+			}
+			return derived
+		}
+
+		function thoughtTimelineLabel(entry, t) {
+			const type = safeString(entry.type) || 'status'
+			const to = safeString(entry.to)
+			const from = safeString(entry.from)
+			if (type === 'status') {
+				if (from && to) return thoughtStatusLabel(from, t) + ' → ' + thoughtStatusLabel(to, t)
+				if (to) return thoughtStatusLabel(to, t)
+				return t('thought.status.unknown')
+			}
+			if (type === 'ticket') return t('thought.ticketCreated', { id: safeString(entry.ticketId) })
+			if (type === 'retry') return t('thought.retryOf', { id: safeString(entry.thoughtId) })
+			if (type === 'edit') return t('thought.edited')
+			if (type === 'delete') return t('thought.deleted')
+			return type
+		}
+
 		function ThoughtRowView(props) {
-			const { t, thought, expanded, onToggle, onOpenTicket, openSession } = props
+			const { t, thought, expanded, pending, onToggle, onOpenTicket, openSession, onRetry, onCancel, onEdit, onDelete, onOpenThought } = props
 			const text = safeString(thought.text)
 			const status = safeString(thought.status)
 			const errorText = safeString(thought.error)
 			const chips = safeArray(thought.ticketIds).filter((id) => typeof id === 'string' && id)
-			const expandable = text.length > 160
-			const statusKey = THOUGHT_STATUSES.indexOf(status) === -1 ? 'recorded' : status
-			return h(
-				'div',
-				{ className: 'kb-thoughtRow' },
-				h(
-					'div',
-					{ className: 'kb-thoughtTop' },
-					h('span', { className: 'kb-thoughtStatus kb-thoughtStatus--' + statusKey }, thoughtStatusLabel(status, t)),
-					h('span', { className: 'kb-thoughtAge' }, formatAge(safeNumber(thought.updatedAt, safeNumber(thought.createdAt, 0)), t)),
-				),
-				h('div', { className: classNames('kb-thoughtText', expanded === true && 'kb-thoughtText--expanded') }, text),
-				expandable
-					? h(
-							'button',
-							{ type: 'button', className: 'kb-thoughtExpand', onClick: onToggle, 'aria-expanded': expanded === true ? 'true' : 'false' },
-							expanded === true ? t('thought.collapse') : t('thought.expand'),
-						)
-					: null,
-				status === 'failed' && errorText ? h('div', { className: 'kb-thoughtError' }, errorText) : null,
-				chips.length > 0 || thought.sessionId
+			const statusKey = THOUGHT_STATUSES.indexOf(status) === -1 ? 'unknown' : status
+			const isExpanded = expanded === true
+			const retryOf = safeString(thought.retryOf)
+			const timeline = isExpanded ? thoughtTimelineEntries(thought) : []
+			const retryTargetKnown = retryOf !== '' && props.retryTargetKnown === true
+			const [editing, setEditing] = useState(false)
+			const [draft, setDraft] = useState(text)
+			const [invalid, setInvalid] = useState(false)
+			// KB-60: the collapsed row is one plain-projection string, derived once per
+			// stored text so the 2.5 s poll never re-projects every row.
+			const preview = useMemo(() => markdownPlainLabel(text), [text])
+			const busy =
+				safeNumber(pending && pending['thought-retry:' + thought.id], 0) > 0 ||
+				safeNumber(pending && pending['thought-cancel:' + thought.id], 0) > 0 ||
+				safeNumber(pending && pending['thought-edit:' + thought.id], 0) > 0 ||
+				safeNumber(pending && pending['thought-delete:' + thought.id], 0) > 0
+			const editable = status === 'queued' || status === 'failed' || status === 'cancelled'
+			const deletable = status !== 'working'
+			const startEdit = () => {
+				setDraft(text)
+				setInvalid(false)
+				setEditing(true)
+			}
+			const saveEdit = async () => {
+				const next = draft.trim()
+				if (!next) {
+					setInvalid(true)
+					return
+				}
+				const result = await onEdit(thought.id, next)
+				if (result && result.ok) {
+					setEditing(false)
+					setInvalid(false)
+				}
+			}
+			const controls = []
+			if (!editing) {
+				if (status === 'failed') {
+					controls.push(h(Button, { key: 'retry', size: 'sm', variant: 'ghost', disabled: busy, onClick: () => void onRetry(thought.id) }, t('thought.retry')))
+				}
+				if (status === 'working') {
+					controls.push(h(Button, { key: 'cancel', size: 'sm', variant: 'danger', icon: h(IconClose, { size: 12 }), disabled: busy, onClick: () => void onCancel(thought.id) }, t('thought.cancel')))
+				}
+				if (editable) {
+					controls.push(h(Button, { key: 'edit', size: 'sm', variant: 'ghost', icon: h(IconEdit, { size: 12 }), disabled: busy, onClick: startEdit }, t('thought.edit')))
+				}
+			}
+			const meta =
+				chips.length > 0 || thought.sessionId || retryOf
 					? h(
 							'div',
 							{ className: 'kb-thoughtMeta' },
@@ -4672,17 +7913,162 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									)
 								: null,
 						  )
+						: null
+			return h(
+				'div',
+				{ className: 'kb-thoughtRow' },
+				h(
+					'div',
+					{ className: 'kb-thoughtTop' },
+					h('span', { className: 'kb-thoughtStatus kb-thoughtStatus--' + statusKey }, thoughtStatusLabel(status, t)),
+					status === 'queued' ? h('span', { className: 'kb-thoughtHint', title: t('thought.queuedHint') }, t('thought.queuedHint')) : null,
+					h('span', { className: 'kb-thoughtAge' }, formatAge(safeNumber(thought.updatedAt, safeNumber(thought.createdAt, 0)), t)),
+				),
+				editing
+					? h(
+							'div',
+							{ className: 'kb-thoughtEditForm' },
+							h('textarea', {
+								className: classNames('kb-textarea', invalid && 'kb-textarea--invalid'),
+								value: draft,
+								rows: 4,
+								maxLength: 4000,
+								'aria-label': t('thought.editPlaceholder'),
+								placeholder: t('thought.editPlaceholder'),
+								onChange: (event) => {
+									setDraft(event.target.value)
+									if (invalid) setInvalid(false)
+								},
+							}),
+							invalid ? h('div', { className: 'kb-thoughtError' }, t('thought.emptyError')) : null,
+							h(
+								'div',
+								{ className: 'kb-thoughtEditFoot' },
+								h(Button, { size: 'sm', variant: 'ghost', onClick: () => setEditing(false) }, t('thought.cancelEdit')),
+								h(Button, { size: 'sm', variant: 'primary', disabled: busy, onClick: () => void saveEdit() }, t('thought.save')),
+							),
+						  )
+					: h(
+							'div',
+							{ className: classNames('kb-thoughtText', isExpanded && 'kb-thoughtText--expanded') },
+							// KB-60: expanded rows render the shipped MarkdownBody; the collapsed
+							// row keeps its deterministic, marker-free single-line projection so
+							// the 3-line clamp never measures a block layout.
+							isExpanded ? h(MarkdownBody, { text, t }) : preview,
+					  ),
+				retryOf
+					? h(
+							'div',
+							{ className: 'kb-thoughtRetryOf' },
+							retryTargetKnown
+								? h(
+										'button',
+										{
+											type: 'button',
+											className: 'kb-thoughtChip',
+											title: t('thought.retryOf', { id: retryOf }),
+											onClick: () => onOpenThought(retryOf),
+										},
+										t('thought.retryOf', { id: retryOf }),
+									)
+								: h('span', null, t('thought.retryOfPlain', { id: retryOf })),
+						  )
 					: null,
+				editing
+					? null
+					: h(
+							'button',
+							{
+								type: 'button',
+								className: 'kb-thoughtExpand',
+								onClick: onToggle,
+								'aria-expanded': isExpanded ? 'true' : 'false',
+							},
+							isExpanded ? t('thought.collapse') : t('thought.expand'),
+						),
+				errorText ? h('div', { className: 'kb-thoughtError' }, errorText) : null,
+				isExpanded && timeline.length > 0
+					? h(
+							'div',
+							{ className: 'kb-thoughtDetail' },
+							h('span', { className: 'kb-thoughtDetailHead' }, t('thought.timeline')),
+							h(
+								'ul',
+								{ className: 'kb-thoughtTimeline' },
+								timeline.map((entry, index) =>
+									h(
+										'li',
+										{ key: 'tl-' + index, className: 'kb-thoughtTimelineItem' },
+										h(
+											'span',
+											{ className: 'kb-thoughtTimelineAt', title: new Date(safeNumber(entry.at, 0)).toISOString() },
+											formatAge(safeNumber(entry.at, 0), t),
+										),
+										h('span', { className: 'kb-thoughtTimelineText' }, thoughtTimelineLabel(entry, t)),
+									),
+								),
+							),
+						  )
+					: null,
+				meta,
+				editing
+					? null
+					: controls.length > 0 || deletable
+						? h(
+								'div',
+								{ className: 'kb-thoughtControls' },
+								controls,
+								deletable ? h(ThoughtDeleteControl, { key: 'delete', t, busy, onDelete: () => void onDelete(thought.id) }) : null,
+						  )
+						: null,
+			)
+		}
+
+		/** Two-step delete for a thought (same armed pattern as the ticket drawer). */
+		function ThoughtDeleteControl(props) {
+			const { t, busy, onDelete } = props
+			const [armed, setArmed] = useState(false)
+			useEffect(() => {
+				if (!armed) return undefined
+				const timer = window.setTimeout(() => setArmed(false), 4000)
+				return () => window.clearTimeout(timer)
+			}, [armed])
+			return h(
+				Button,
+				{
+					size: 'sm',
+					variant: 'ghost',
+					icon: h(IconTrash, { size: 12 }),
+					disabled: busy,
+					onClick: () => {
+						if (!armed) {
+							setArmed(true)
+							return
+						}
+						setArmed(false)
+						onDelete()
+					},
+				},
+				armed ? t('actions.confirmDelete') : t('thought.delete'),
 			)
 		}
 
 		function ThoughtsDrawer(props) {
-			const { t, thoughts, onOpenTicket, openSession, onClose } = props
+			const { t, thoughts, pending, focusThoughtId, onOpenTicket, openSession, onClose, onRetry, onCancel, onEdit, onDelete } = props
 			const closeRef = useRef(null)
-			const [expanded, setExpanded] = useState({})
+			// A ticket-drawer chip opens this drawer with its thought already expanded.
+			const [expanded, setExpanded] = useState(() => (typeof focusThoughtId === 'string' && focusThoughtId ? { [focusThoughtId]: true } : {}))
 			useEscape(true, onClose)
 			useFocusOnOpen(true, closeRef)
 			const rows = safeArray(thoughts).filter((thought) => thought && typeof thought.id === 'string' && thought.id)
+			const queued = rows.filter((thought) => thought.status === 'queued').length
+			const rowIds = rows.map((thought) => thought.id)
+			// A retry link only resolves inside the current 50-row window; otherwise
+			// the row shows the plain id instead of a dead link.
+			const revealThought = (thoughtId) => {
+				if (typeof thoughtId !== 'string' || !thoughtId) return
+				setExpanded((previous) => ({ ...previous, [thoughtId]: true }))
+			}
 			return h(
 				'div',
 				{ className: 'kb-overlay kb-overlay--right', onClick: onClose },
@@ -4703,6 +8089,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							{ className: 'kb-drawerHeadMain' },
 							h('span', { className: 'kb-drawerId' }, t('header.thoughts')),
 							rows.length > 0 ? h('span', { className: 'kb-thoughtsHeadCount' }, t('thought.count', { n: rows.length })) : null,
+							queued > 0 ? h('span', { className: 'kb-thoughtsHeadCount kb-thoughtsHeadCount--queued' }, t('thought.queuedCount', { n: queued })) : null,
 						),
 						h(
 							'button',
@@ -4739,6 +8126,12 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 											onToggle: () => setExpanded((previous) => ({ ...previous, [thought.id]: !previous[thought.id] })),
 											onOpenTicket,
 											openSession,
+											onRetry,
+											onCancel,
+											onEdit: onEdit,
+											onDelete: onDelete,
+											onOpenThought: revealThought,
+											retryTargetKnown: Boolean(thought.retryOf) && rowIds.indexOf(thought.retryOf) !== -1,
 										}),
 									),
 								),
@@ -4861,7 +8254,15 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 								h('span', { className: 'kb-fieldLabel' }, t('new.type')),
 								h(
 									'select',
-									{ className: 'kb-select', value: type, onChange: (event) => setType(event.target.value) },
+									{
+										className: 'kb-select',
+										value: type,
+										onChange: (event) => {
+											const next = event.target.value
+											setType(next)
+											if (next === 'epic') setColumn('backlog')
+										},
+									},
 									TYPES.map((item) => h('option', { key: item, value: item }, t('types.' + item))),
 								),
 							),
@@ -4892,9 +8293,15 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 								h('span', { className: 'kb-fieldLabel' }, t('new.column')),
 								h(
 									'select',
-									{ className: 'kb-select', value: column, onChange: (event) => setColumn(event.target.value) },
+									{
+										className: 'kb-select',
+										value: type === 'epic' ? 'backlog' : column,
+										disabled: type === 'epic',
+										onChange: (event) => setColumn(event.target.value),
+									},
 									COLUMNS.map((item) => h('option', { key: item, value: item }, t('columns.' + item))),
 								),
+								type === 'epic' ? h('span', { className: 'kb-hint kb-hint--epic' }, t('new.epicHint')) : null,
 							),
 						),
 					),
@@ -4937,7 +8344,11 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const docs = safeArray(data && data.docs)
 			const mrs = safeArray(data && data.mrs)
 			const conversations = safeArray(data && data.conversations)
-			const vision = data ? safeString(data.vision) : ''
+			// KB-61: the vision and candidate descriptions are Markdown sources.
+			// A whitespace-only vision is semantically empty — no `.kb-md` node and
+			// no added content height — so it is omitted exactly like a missing one.
+			const visionSource = data ? safeString(data.vision) : ''
+			const vision = visionSource.trim() === '' ? '' : visionSource
 
 			return h(
 				'div',
@@ -4997,7 +8408,16 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 														'div',
 														{ className: 'kb-section' },
 														h(SectionHead, { title: t('scan.vision') }),
-														h('div', { className: 'kb-vision' }, vision),
+														h(
+															'div',
+															{
+																className: 'kb-vision',
+																role: 'region',
+																tabIndex: 0,
+																'aria-label': t('scan.vision'),
+															},
+															h(MarkdownBody, { text: vision, t }),
+														),
 													)
 												: null,
 											h(
@@ -5108,9 +8528,17 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 																	h(
 																		'span',
 																		{ className: 'kb-candidateMain' },
-																		h('span', { className: 'kb-candidateTitle' }, safeString(candidate.title)),
+																		h(
+																			'span',
+																			{ className: 'kb-candidateTitle', title: safeString(candidate.title) },
+																			safeString(candidate.title),
+																		),
 																		safeString(candidate.description)
-																			? h('span', { className: 'kb-candidateDesc' }, candidate.description)
+																			? h(
+																					'span',
+																					{ className: 'kb-candidateDesc' },
+																					h(MarkdownBody, { text: safeString(candidate.description), t }),
+																				)
 																			: null,
 																		h(
 																			'span',
@@ -5198,6 +8626,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const t = typeof props.t === 'function' ? props.t : (key) => key
 			const openSessionProp = props.openSession
 			const readSessionCwd = props.readSessionCwd
+			const getSpeech = props.getSpeech
 
 			const { toasts, notify, dismiss } = useToasts()
 			const [workspaceId, setWorkspaceId] = useState(readStoredWorkspace)
@@ -5216,6 +8645,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const [scan, setScan] = useState(emptyScanState)
 			const [thoughtOpen, setThoughtOpen] = useState(false)
 			const [thoughtsOpen, setThoughtsOpen] = useState(false)
+			const [thoughtFocus, setThoughtFocus] = useState('')
 			const [drag, setDrag] = useState(null)
 			const [dragOver, setDragOver] = useState(null)
 			const bootedRef = useRef(false)
@@ -5247,7 +8677,10 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					if (node && typeof node.focus === 'function') node.focus()
 				}, 0)
 			}, [])
-			const closeThoughts = useCallback(() => setThoughtsOpen(false), [])
+			const closeThoughts = useCallback(() => {
+				setThoughtsOpen(false)
+				setThoughtFocus('')
+			}, [])
 			const closeMemberEditor = useCallback(() => setMemberEditor(null), [])
 			const closeRoles = useCallback(() => setRolesOpen(false), [])
 			const openNewMember = useCallback(() => setMemberEditor({ memberId: null }), [])
@@ -5349,6 +8782,176 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				if (!board || !Array.isArray(board.tickets)) return []
 				return board.tickets.filter((ticket) => ticket && typeof ticket === 'object' && typeof ticket.id === 'string')
 			}, [board])
+
+			// -- Autopilot controls (KB-76) -------------------------------------
+			// The view is derived from the snapshot read model; the reducer owns the
+			// optimistic configure value, the busy guard and the rollback. The
+			// popover open state stays outside the reducer so a poll cannot close it.
+			const [autopilotOpen, setAutopilotOpen] = useState(false)
+			const [autopilotUi, setAutopilotUi] = useState(() => initialAutopilotUi(null))
+			const autopilotView = useMemo(() => autopilotViewFromSnapshot(snapshot), [snapshot])
+			const autopilotBtnRef = useRef(null)
+			const autopilotWrapRef = useRef(null)
+			const autopilotQueueRef = useRef(null)
+			const autopilotSendRef = useRef(null)
+			const autopilotSeqRef = useRef(0)
+			const autopilotUiRef = useRef(autopilotUi)
+			autopilotUiRef.current = autopilotUi
+
+			const closeAutopilot = useCallback(() => {
+				setAutopilotOpen(false)
+				// Return focus to the header entry so the keyboard path survives the
+				// re-render; deferred one tick like the thought dialog's restore.
+				window.setTimeout(() => {
+					const node = autopilotBtnRef.current
+					if (node && typeof node.focus === 'function') node.focus()
+				}, 0)
+			}, [])
+			useOutsideClick(autopilotOpen, autopilotWrapRef, closeAutopilot)
+			useEscape(autopilotOpen, closeAutopilot)
+
+			useEffect(() => {
+				setAutopilotOpen(false)
+				setAutopilotUi(initialAutopilotUi(workspaceId))
+			}, [workspaceId])
+
+			useEffect(() => {
+				setAutopilotUi((previous) =>
+					reduceAutopilot(previous, {
+						type: 'sync',
+						available: autopilotView.available,
+						config: autopilotView.config,
+						pauseCause: autopilotView.pauseCause,
+						membersPaused: autopilotView.membersPaused,
+						budget: autopilotView.budget,
+						nextTickAt: autopilotView.nextTickAt,
+						lastPulse: autopilotView.lastPulse,
+					}),
+				)
+			}, [autopilotView])
+
+			// KB-77 lane admission chips. Occupancy comes from the shipped ticket
+			// execution rows; the cap is the configured (or optimistically edited)
+			// cap. No admission policy is recomputed here.
+			const autopilotLaneChips = useMemo(() => {
+				if (autopilotView.available !== true) return null
+				return autopilotLaneAdmissions(
+					{
+						available: true,
+						config: autopilotUi.values || autopilotView.config,
+						paused: autopilotView.paused,
+						occupancy: autopilotView.laneOccupancy,
+					},
+					t,
+				)
+			}, [autopilotView, autopilotUi.values, t])
+
+			const flushAutopilotConfigure = useCallback(
+				async (patch) => {
+					if (!patch || typeof patch !== 'object') return
+					autopilotSeqRef.current += 1
+					const seq = autopilotSeqRef.current
+					setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'configure/send', seq }))
+					const result = await act('autopilot', { op: 'configure', patch }, {
+						key: 'autopilot-configure',
+						quiet: true,
+						refresh: false,
+					})
+					if (result.ok) {
+						const config = autopilotConfigFromStatus(result.value)
+						setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'configure/ok', seq, config }))
+						if (patch.enabled === true && !readAutopilotConfirmSeen()) {
+							setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'phase1/show' }))
+						}
+					} else {
+						setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'configure/fail', seq, error: result.error }))
+					}
+				},
+				[act],
+			)
+			autopilotSendRef.current = flushAutopilotConfigure
+			if (!autopilotQueueRef.current) {
+				autopilotQueueRef.current = createAutopilotCommitQueue(window, AUTOPILOT_COMMIT_MS, (patch) => {
+					const send = autopilotSendRef.current
+					if (typeof send === 'function') void send(patch)
+				})
+			}
+			useEffect(
+				() => () => {
+					if (autopilotQueueRef.current) autopilotQueueRef.current.cancel()
+				},
+				[],
+			)
+
+			const configureAutopilot = useCallback((patch) => {
+				if (!patch || typeof patch !== 'object') return
+				setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'configure/optimistic', patch }))
+				const queue = autopilotQueueRef.current
+				if (!queue) return
+				queue.push(patch)
+				// Turning the master switch off is a synchronous host stop; do not
+				// leave it sitting in the debounce window.
+				if (patch.enabled === false) queue.flushNow()
+			}, [])
+
+			const previewAutopilot = useCallback(async () => {
+				if (!canPreviewAutopilot(autopilotUiRef.current)) return
+				setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'preview/start' }))
+				const result = await act('autopilot', { op: 'plan' }, { key: 'autopilot-plan', quiet: true, refresh: false })
+				if (result.ok) {
+					setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'preview/ok', plan: result.value, at: Date.now() }))
+				} else {
+					setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'preview/fail', error: result.error }))
+				}
+			}, [act])
+
+			const pulseAutopilot = useCallback(async () => {
+				if (!canPulseAutopilot(autopilotUiRef.current)) return
+				setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'pulse/start' }))
+				const result = await act('autopilot', { op: 'pulseNow' }, { key: 'autopilot-pulse', quiet: true })
+				if (result.ok) {
+					const pulse = result.value && typeof result.value === 'object' ? result.value.pulse : null
+					setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'pulse/ok', pulse }))
+					notify('ok', t('autopilot.pulseDone', { id: pulse && typeof pulse.id === 'string' ? pulse.id : '—' }))
+				} else {
+					setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'pulse/fail', error: result.error }))
+				}
+			}, [act, notify, t])
+
+			const dismissAutopilotError = useCallback(() => {
+				setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'error/dismiss' }))
+			}, [])
+
+			const dismissAutopilotPhase1 = useCallback(() => {
+				markAutopilotConfirmSeen()
+				setAutopilotUi((previous) => reduceAutopilot(previous, { type: 'phase1/dismiss' }))
+			}, [])
+
+			// KB-3 EPIC model: parent/child relations are derived from board.tickets
+			// only; the snapshot adds no collection and older snapshots simply have none.
+			const ticketById = useMemo(() => {
+				const map = new Map()
+				tickets.forEach((ticket) => map.set(ticket.id, ticket))
+				return map
+			}, [tickets])
+			const childrenByParent = useMemo(() => {
+				const map = new Map()
+				tickets.forEach((ticket) => {
+					if (typeof ticket.parentId !== 'string' || !ticket.parentId) return
+					const list = map.get(ticket.parentId) || []
+					list.push(ticket)
+					map.set(ticket.parentId, list)
+				})
+				return map
+			}, [tickets])
+			const parentOf = useCallback(
+				(ticket) => (ticket && typeof ticket.parentId === 'string' ? ticketById.get(ticket.parentId) || null : null),
+				[ticketById],
+			)
+			const childCountOf = useCallback(
+				(ticket) => (ticket && typeof ticket.id === 'string' ? safeArray(childrenByParent.get(ticket.id)).length : 0),
+				[childrenByParent],
+			)
 			const team = useMemo(() => {
 				if (!snapshot || !Array.isArray(snapshot.team)) return []
 				return snapshot.team.filter((agent) => agent && typeof agent.sessionId === 'string')
@@ -5368,6 +8971,12 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			const thoughts = useMemo(() => {
 				if (!snapshot || !Array.isArray(snapshot.thoughts)) return []
 				return snapshot.thoughts.filter((thought) => thought && typeof thought.id === 'string' && thought.id)
+			}, [snapshot])
+			// KB-5: ids of soft-deleted thoughts (most recent 100) let the ticket
+			// drawer distinguish "Thought deleted" from "not in the loaded window".
+			const deletedThoughtIds = useMemo(() => {
+				if (!snapshot || !Array.isArray(snapshot.deletedThoughtIds)) return []
+				return snapshot.deletedThoughtIds.filter((id) => typeof id === 'string' && id)
 			}, [snapshot])
 			const workingThoughts = useMemo(
 				() => thoughts.filter((thought) => thought.status === 'working').length,
@@ -5576,6 +9185,27 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				(text) => act('submitThought', { text }, { key: 'submitThought' }),
 				[act],
 			)
+			const retryThoughtAction = useCallback(
+				(thoughtId) => act('retryThought', { thoughtId }, { key: 'thought-retry:' + thoughtId }),
+				[act],
+			)
+			const cancelThoughtAction = useCallback(
+				(thoughtId) => act('cancelThought', { thoughtId }, { key: 'thought-cancel:' + thoughtId }),
+				[act],
+			)
+			const editThoughtAction = useCallback(
+				(thoughtId, text) => act('editThought', { thoughtId, text }, { key: 'thought-edit:' + thoughtId }),
+				[act],
+			)
+			const deleteThoughtAction = useCallback(
+				(thoughtId) => act('deleteThought', { thoughtId }, { key: 'thought-delete:' + thoughtId }),
+				[act],
+			)
+			const openThoughtsAt = useCallback((thoughtId) => {
+				setSelectedId(null)
+				if (typeof thoughtId === 'string' && thoughtId) setThoughtFocus(thoughtId)
+				setThoughtsOpen(true)
+			}, [])
 
 			const openThoughtTicket = useCallback(
 				(ticketId) => {
@@ -5583,28 +9213,6 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 					openTicket(ticketId)
 				},
 				[openTicket],
-			)
-
-			const toggleAgent = useCallback(
-				(agent) => {
-					if (!agent || typeof agent.sessionId !== 'string') return
-					const resuming = agent.paused === true
-					void act(resuming ? 'resumeAgent' : 'pauseAgent', { sessionId: agent.sessionId }, {
-						key: 'agent:' + agent.sessionId,
-						toastText: t(resuming ? 'toast.agentResumed' : 'toast.agentPaused', {
-							name: safeString(agent.name) || agent.sessionId,
-						}),
-					})
-				},
-				[act, t],
-			)
-
-			const setAgentRole = useCallback(
-				(agent, role) => {
-					if (!agent || typeof agent.sessionId !== 'string' || !role) return
-					void act('setAgentRole', { sessionId: agent.sessionId, role }, { key: 'role:' + agent.sessionId })
-				},
-				[act],
 			)
 
 			const toggleMemberPause = useCallback(
@@ -5707,9 +9315,17 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 
 			const onDragStart = useCallback(
 				(event, ticket) => {
-					if (paused || ticket.blocked === true) {
+					// EPICs are pinned to Backlog: refuse the drag and say why.
+					if (paused || ticket.blocked === true || ticket.type === 'epic') {
 						event.preventDefault()
-						notify('warn', paused ? t('toast.boardPausedMove') : t('toast.blockedMove'))
+						notify(
+							'warn',
+							paused
+								? t('toast.boardPausedMove')
+								: ticket.type === 'epic'
+									? t('card.epicLockedHint')
+									: t('toast.blockedMove'),
+						)
 						return
 					}
 					try {
@@ -5947,6 +9563,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 						over: dragOver,
 						roleName,
 						filterActive,
+						laneAdmissions: autopilotLaneChips,
 						onOpenTicket: openTicket,
 						onAddTicket: addTicketTo,
 						onDragStart,
@@ -5956,6 +9573,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 						onDrop,
 						onRun: runTicketAction,
 						pending,
+						parentOf,
+						childCountOf,
+						onOpenParent: openTicket,
 					}),
 				)
 			}
@@ -6097,6 +9717,27 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 										})
 									: null,
 							),
+							h(AutopilotControl, {
+								key: 'autopilot:' + String(workspaceId || ''),
+								t,
+								open: autopilotOpen,
+								onOpen: () => setAutopilotOpen(true),
+								onClose: closeAutopilot,
+								onConfigure: configureAutopilot,
+								onPreview: () => void previewAutopilot(),
+								onPulse: () => void pulseAutopilot(),
+								onDismissError: dismissAutopilotError,
+								onDismissPhase1: dismissAutopilotPhase1,
+								entryRef: autopilotBtnRef,
+								wrapRef: autopilotWrapRef,
+								state: autopilotUi,
+								view: autopilotView,
+								tickets,
+								roster,
+								roleName,
+								loading: phase === 'loading',
+								onOpenTicket: openTicket,
+							}),
 							// Everything after the filters is a board action: the Thoughts
 							// drawer and the single primary entry point sit immediately
 							// before the ticket actions.
@@ -6122,7 +9763,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									title: paused ? t('thought.pausedHint') : t('header.speakThought'),
 									'aria-label': t('header.speakThought'),
 									buttonRef: thoughtCtaRef,
-									disabled: !canEdit || !board,
+									// KB-5: capture stays open while paused; the host queues it.
+									disabled: !board,
 									onClick: () => setThoughtOpen(true),
 								},
 								h('span', { className: 'kb-btnLabel' }, t('header.speakThought')),
@@ -6255,7 +9897,6 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 						showTeam
 							? h(TeamRail, {
 									t,
-									team,
 									roster,
 									drafts,
 									board,
@@ -6264,9 +9905,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									pending,
 									pauseBusy: isBusy('boardPause'),
 									roleName,
+									autopilot: autopilotView,
 									onOpenTicket: openTicket,
-									onToggleAgent: toggleAgent,
-									onSetRole: setAgentRole,
 									onToggleBoard: toggleBoardPause,
 									onClose: () => setShowTeam(false),
 									onAddMember: openNewMember,
@@ -6304,6 +9944,9 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									t,
 									ticket: selectedTicket,
 									team,
+									thoughts,
+									deletedThoughtIds,
+									onOpenThought: openThoughtsAt,
 									roles,
 									paused,
 									pending,
@@ -6315,6 +9958,8 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									onCancelExecution: cancelExecutionAction,
 									onAnswerExecution: answerExecutionAction,
 									accessModes,
+									children: safeArray(childrenByParent.get(selectedTicket.id)),
+									onOpenTicket: openTicket,
 									onClose: closeDrawer,
 								})
 							: null,
@@ -6332,6 +9977,7 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 									t,
 									onSubmit: submitThoughtAction,
 									onClose: closeThought,
+									getSpeech,
 								})
 							: null,
 						scan.open
@@ -6349,8 +9995,14 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 							? h(ThoughtsDrawer, {
 									t,
 									thoughts,
+									pending,
+									focusThoughtId: thoughtFocus,
 									onOpenTicket: openThoughtTicket,
 									openSession: notifyOpenSession,
+									onRetry: retryThoughtAction,
+									onCancel: cancelThoughtAction,
+									onEdit: editThoughtAction,
+									onDelete: deleteThoughtAction,
 									onClose: closeThoughts,
 								})
 							: null,
@@ -6418,6 +10070,1271 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 		}
 
 		// ------------------------------------------------------------------
+		// Safe Markdown engine (KB-56)
+		//
+		// Pure, dependency-free Markdown pipeline. `parseMarkdown` turns
+		// untrusted Markdown into a deep-frozen AST; `renderMarkdown(ast, h)`
+		// renders it to React elements through the injected `h` factory. There
+		// is no HTML string path and no raw-HTML injection API; every rendered
+		// element and attribute comes from a closed allowlist.
+		// ------------------------------------------------------------------
+
+		const MARKDOWN_HEADING_TAGS = Object.freeze({ 1: 'h3', 2: 'h4', 3: 'h5', 4: 'h6', 5: 'h6', 6: 'h6' })
+		const MARKDOWN_ALLOWED_SCHEMES = Object.freeze(['http', 'https', 'mailto'])
+		const MARKDOWN_MAX_INLINE_DEPTH = 60
+		const MARKDOWN_MAX_BLOCK_DEPTH = 24
+		const MARKDOWN_NAMED_ENTITIES = Object.freeze({
+			amp: '&',
+			lt: '<',
+			gt: '>',
+			quot: '"',
+			apos: "'",
+			nbsp: '\u00a0',
+		})
+		const MARKDOWN_ENTITY_RE = /&(?:#(\d{1,7})|#[xX]([\da-fA-F]{1,6})|([a-zA-Z][a-zA-Z0-9]{1,31}));/g
+		const MARKDOWN_ENTITY_AT_RE = /&(?:#(\d{1,7})|#[xX]([\da-fA-F]{1,6})|([a-zA-Z][a-zA-Z0-9]{1,31}));/y
+		const MARKDOWN_URI_AUTOLINK_RE = /<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*)>/y
+		const MARKDOWN_EMAIL_AUTOLINK_RE = /<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)>/y
+		const MARKDOWN_ASCII_PUNCTUATION_RE = /[!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~]/
+
+		function markdownCodePoint(code) {
+			if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) return '\ufffd'
+			if (code >= 0xd800 && code <= 0xdfff) return '\ufffd'
+			try {
+				return String.fromCodePoint(code)
+			} catch (error) {
+				return '\ufffd'
+			}
+		}
+
+		function markdownEntityValue(match) {
+			if (match[1]) return markdownCodePoint(parseInt(match[1], 10))
+			if (match[2]) return markdownCodePoint(parseInt(match[2], 16))
+			const named = MARKDOWN_NAMED_ENTITIES[match[3]]
+			return named === undefined ? match[0] : named
+		}
+
+		/** Decode the entity subset we support; unknown or malformed entities stay literal. */
+		function markdownDecodeEntitiesIn(value) {
+			if (typeof value !== 'string' || value.indexOf('&') === -1) return value
+			return value.replace(MARKDOWN_ENTITY_RE, function replaceEntity(match, dec, hex, name) {
+				return markdownEntityValue([match, dec, hex, name])
+			})
+		}
+
+		/** Backslash escapes for ASCII punctuation only (CommonMark). */
+		function markdownUnescape(value) {
+			if (typeof value !== 'string' || value.indexOf('\\') === -1) return value
+			return value.replace(/\\([!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~])/g, '$1')
+		}
+
+		function markdownNormalize(source) {
+			const text = typeof source === 'string' ? source : ''
+			return text.replace(/\r\n?/g, '\n')
+		}
+
+		function markdownDeepFreeze(value) {
+			if (Array.isArray(value)) {
+				for (let index = 0; index < value.length; index += 1) markdownDeepFreeze(value[index])
+				return Object.freeze(value)
+			}
+			if (value && typeof value === 'object') {
+				const keys = Object.keys(value)
+				for (let index = 0; index < keys.length; index += 1) markdownDeepFreeze(value[keys[index]])
+				return Object.freeze(value)
+			}
+			return value
+		}
+
+		function markdownTextNode(value) {
+			return { type: 'text', value: String(value === undefined ? '' : value) }
+		}
+
+		function markdownIsBlank(line) {
+			return /^[ \t]*$/.test(line)
+		}
+
+		function markdownLeadingColumns(line) {
+			let columns = 0
+			for (let index = 0; index < line.length; index += 1) {
+				const ch = line.charAt(index)
+				if (ch === ' ') columns += 1
+				else if (ch === '\t') columns += 4 - (columns % 4)
+				else break
+			}
+			return columns
+		}
+
+		function markdownStripColumns(line, count) {
+			let columns = 0
+			let index = 0
+			while (index < line.length && columns < count) {
+				const ch = line.charAt(index)
+				if (ch === ' ') {
+					columns += 1
+					index += 1
+				} else if (ch === '\t') {
+					columns += 4 - (columns % 4)
+					index += 1
+				} else break
+			}
+			return line.slice(index)
+		}
+
+		function markdownFenceMatch(line) {
+			const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line)
+			if (!match) return null
+			const marker = match[1]
+			const info = match[2]
+			if (marker.charAt(0) === '`' && info.indexOf('`') !== -1) return null
+			return {
+				marker: marker.charAt(0),
+				length: marker.length,
+				info: info.trim(),
+				close: new RegExp('^ {0,3}' + (marker.charAt(0) === '`' ? '`' : '~') + '{' + marker.length + ',}[ \\t]*$'),
+			}
+		}
+
+		function markdownAtxMatch(line) {
+			const match = /^ {0,3}(#{1,6})(?!#)(?:[ \t]+(.*?))?[ \t]*$/.exec(line)
+			if (!match) return null
+			let content = match[2] === undefined ? '' : match[2]
+			content = content.replace(/[ \t]+#+[ \t]*$/, '')
+			return { level: match[1].length, content: content.trim() }
+		}
+
+		function markdownIsThematicBreak(line) {
+			return (
+				/^ {0,3}(?:\*[ \t]*){3,}$/.test(line) ||
+				/^ {0,3}(?:-[ \t]*){3,}$/.test(line) ||
+				/^ {0,3}(?:_[ \t]*){3,}$/.test(line)
+			)
+		}
+
+		function markdownIsSetextUnderline(line) {
+			return /^ {0,3}(?:=+|-+)[ \t]*$/.test(line)
+		}
+
+		function markdownBlockquoteMatch(line) {
+			const match = /^ {0,3}>[ \t]?(.*)$/.exec(line)
+			return match ? match[1] : null
+		}
+
+		function markdownListMarker(line) {
+			const match = /^( {0,3})([-+*]|([0-9]{1,9})[.)])([ \t]+|$)/.exec(line)
+			if (!match) return null
+			const indent = match[1].length
+			const marker = match[2]
+			const rest = line.slice(indent + marker.length)
+			const spacing = /^[ \t]*/.exec(rest)[0]
+			const padding = spacing.length >= 1 && spacing.length <= 4 ? spacing.length : 1
+			const ordered = /^[0-9]/.test(marker)
+			return {
+				indent,
+				ordered,
+				number: ordered ? parseInt(marker, 10) : 1,
+				contentIndent: indent + marker.length + padding,
+				content: markdownStripColumns(rest, padding),
+			}
+		}
+
+		function markdownStartsBlock(lines, index) {
+			const line = lines[index]
+			if (line === undefined) return false
+			if (markdownFenceMatch(line)) return true
+			if (markdownAtxMatch(line)) return true
+			if (markdownIsThematicBreak(line)) return true
+			if (markdownBlockquoteMatch(line) !== null) return true
+			if (markdownListMarker(line)) return true
+			if (markdownLeadingColumns(line) >= 4) return true
+			return false
+		}
+
+		function markdownParseFenced(lines, start, fence) {
+			const content = []
+			let index = start + 1
+			while (index < lines.length) {
+				if (fence.close.test(lines[index])) {
+					index += 1
+					break
+				}
+				content.push(lines[index])
+				index += 1
+			}
+			const lang = fence.info.split(/[ \t]+/)[0] || ''
+			return { block: { type: 'code', lang, value: content.join('\n') }, next: index }
+		}
+
+		function markdownParseIndentedCode(lines, start) {
+			const content = []
+			let index = start
+			let pendingBlanks = 0
+			while (index < lines.length) {
+				const line = lines[index]
+				if (markdownIsBlank(line)) {
+					pendingBlanks += 1
+					index += 1
+					continue
+				}
+				if (markdownLeadingColumns(line) < 4) break
+				for (let blank = 0; blank < pendingBlanks; blank += 1) content.push('')
+				pendingBlanks = 0
+				content.push(markdownStripColumns(line, 4))
+				index += 1
+			}
+			return { block: { type: 'code', lang: '', value: content.join('\n') }, next: index }
+		}
+
+		function markdownParseBlockquote(lines, start, depth) {
+			const inner = []
+			let index = start
+			while (index < lines.length) {
+				const stripped = markdownBlockquoteMatch(lines[index])
+				if (stripped === null) break
+				inner.push(stripped)
+				index += 1
+			}
+			return { block: { type: 'blockquote', children: markdownParseBlocks(inner, depth + 1) }, next: index }
+		}
+
+		function markdownItemPlainText(blocks) {
+			for (let index = 0; index < blocks.length; index += 1) {
+				const block = blocks[index]
+				if (block && block.type === 'paragraph') return markdownPlainInlineText(block.children).trim()
+			}
+			return ''
+		}
+
+		function markdownBuildListItem(item, depth) {
+			let lines = item.lines
+			let task = false
+			let checked = false
+			if (lines.length > 0) {
+				const match = /^\[([ xX])\](?:[ \t]+|$)/.exec(lines[0])
+				if (match) {
+					task = true
+					checked = match[1].toLowerCase() === 'x'
+					const remainder = lines[0].slice(match[0].length)
+					lines = lines.slice()
+					lines[0] = remainder
+					if (lines[0] === '') lines.splice(0, 1)
+				}
+			}
+			const children = markdownParseBlocks(lines, depth)
+			return { type: 'listItem', task, checked, text: markdownItemPlainText(children), children }
+		}
+
+		function markdownParseList(lines, start, depth) {
+			const first = markdownListMarker(lines[start])
+			const ordered = first.ordered
+			const items = []
+			let loose = false
+			let index = start
+			while (index < lines.length) {
+				const marker = markdownListMarker(lines[index])
+				if (!marker || marker.ordered !== ordered) break
+				const item = { lines: [marker.content], contentIndent: marker.contentIndent }
+				index += 1
+				let blankPending = false
+				while (index < lines.length) {
+					const line = lines[index]
+					if (markdownIsBlank(line)) {
+						blankPending = true
+						index += 1
+						continue
+					}
+					if (markdownLeadingColumns(line) >= item.contentIndent) {
+						if (blankPending) {
+							loose = true
+							item.lines.push('')
+						}
+						blankPending = false
+						item.lines.push(markdownStripColumns(line, item.contentIndent))
+						index += 1
+						continue
+					}
+					if (markdownListMarker(line)) {
+						// A blank line between two items makes the whole list loose.
+						if (blankPending) loose = true
+						break
+					}
+					if (markdownStartsBlock(lines, index)) break
+					if (blankPending) break
+					item.lines.push(line.trim())
+					index += 1
+				}
+				let trailing = 0
+				while (item.lines.length > 0 && item.lines[item.lines.length - 1] === '') {
+					item.lines.pop()
+					trailing += 1
+				}
+				items.push(markdownBuildListItem(item, depth + 1))
+				let lookahead = index
+				while (lookahead < lines.length && markdownIsBlank(lines[lookahead])) lookahead += 1
+				const next = lookahead < lines.length ? markdownListMarker(lines[lookahead]) : null
+				if (next && next.ordered === ordered) {
+					if (lookahead > index) loose = true
+					index = lookahead
+					continue
+				}
+				break
+			}
+			return {
+				block: { type: 'list', ordered, start: ordered ? first.number : 1, tight: !loose, children: items },
+				next: index,
+			}
+		}
+
+		function markdownSplitTableRow(line) {
+			const cells = []
+			let current = ''
+			let escaped = false
+			for (let index = 0; index < line.length; index += 1) {
+				const ch = line.charAt(index)
+				if (escaped) {
+					current += ch === '|' ? '|' : '\\' + ch
+					escaped = false
+					continue
+				}
+				if (ch === '\\') {
+					escaped = true
+					continue
+				}
+				if (ch === '|') {
+					cells.push(current)
+					current = ''
+					continue
+				}
+				current += ch
+			}
+			if (escaped) current += '\\'
+			cells.push(current)
+			const trimmed = line.trim()
+			if (trimmed.charAt(0) === '|') cells.shift()
+			if (trimmed.charAt(trimmed.length - 1) === '|' && cells.length > 0) cells.pop()
+			return cells.map((cell) => cell.trim())
+		}
+
+		function markdownTableAlignments(line) {
+			const cells = markdownSplitTableRow(line)
+			if (cells.length === 0) return null
+			const aligns = []
+			for (let index = 0; index < cells.length; index += 1) {
+				const cell = cells[index]
+				if (!/^:?-+:?$/.test(cell)) return null
+				const left = cell.charAt(0) === ':'
+				const right = cell.charAt(cell.length - 1) === ':'
+				aligns.push(left && right ? 'center' : right ? 'right' : left ? 'left' : null)
+			}
+			return aligns
+		}
+
+		function markdownTryTable(lines, start, depth) {
+			const headerLine = lines[start]
+			const delimiterLine = lines[start + 1]
+			if (delimiterLine === undefined) return null
+			const aligns = markdownTableAlignments(delimiterLine)
+			if (!aligns) return null
+			if (headerLine.indexOf('|') === -1 && delimiterLine.indexOf('|') === -1) return null
+			const header = markdownSplitTableRow(headerLine)
+			if (header.length === 0 || header.length !== aligns.length) return null
+			const rows = []
+			let index = start + 2
+			while (index < lines.length) {
+				const line = lines[index]
+				if (markdownIsBlank(line) || line.indexOf('|') === -1) break
+				if (markdownStartsBlock(lines, index)) break
+				const cells = markdownSplitTableRow(line)
+				const normalized = []
+				for (let column = 0; column < header.length; column += 1) {
+					normalized.push(cells[column] === undefined ? '' : cells[column])
+				}
+				rows.push(normalized)
+				index += 1
+			}
+			return {
+				block: {
+					type: 'table',
+					align: aligns,
+					header: header.map((cell) => ({ type: 'tableCell', children: markdownParseInline(cell, 0) })),
+					children: rows.map((row) =>
+						row.map((cell) => ({ type: 'tableCell', children: markdownParseInline(cell, 0) })),
+					),
+				},
+				next: index,
+			}
+		}
+
+		function markdownJoinParagraphLines(lines) {
+			return lines.map((line) => line.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '')).join('\n')
+		}
+
+		function markdownParseParagraph(lines, start) {
+			const collected = []
+			let index = start
+			while (index < lines.length) {
+				const line = lines[index]
+				if (markdownIsBlank(line)) break
+				if (collected.length > 0) {
+					if (markdownIsSetextUnderline(line)) break
+					if (markdownStartsBlock(lines, index)) break
+				}
+				collected.push(line)
+				index += 1
+			}
+			if (index < lines.length && collected.length > 0 && markdownIsSetextUnderline(lines[index])) {
+				const level = lines[index].trim().charAt(0) === '=' ? 1 : 2
+				index += 1
+				return {
+					block: { type: 'heading', level, children: markdownParseInline(markdownJoinParagraphLines(collected), 0) },
+					next: index,
+				}
+			}
+			return {
+				block: { type: 'paragraph', children: markdownParseInline(markdownJoinParagraphLines(collected), 0) },
+				next: index,
+			}
+		}
+
+		function markdownParseBlocks(lines, depth) {
+			if (depth > MARKDOWN_MAX_BLOCK_DEPTH) {
+				const joined = lines
+					.map((line) => line.trim())
+					.filter((line) => line !== '')
+					.join('\n')
+				return joined === ''
+					? []
+					: [{ type: 'paragraph', children: [markdownTextNode(markdownDecodeEntitiesIn(markdownUnescape(joined)))] }]
+			}
+			const blocks = []
+			let index = 0
+			while (index < lines.length) {
+				const line = lines[index]
+				if (markdownIsBlank(line)) {
+					index += 1
+					continue
+				}
+				const fence = markdownFenceMatch(line)
+				if (fence) {
+					const parsed = markdownParseFenced(lines, index, fence)
+					blocks.push(parsed.block)
+					index = parsed.next
+					continue
+				}
+				const atx = markdownAtxMatch(line)
+				if (atx) {
+					blocks.push({ type: 'heading', level: atx.level, children: markdownParseInline(atx.content, 0) })
+					index += 1
+					continue
+				}
+				if (markdownIsThematicBreak(line)) {
+					blocks.push({ type: 'hr' })
+					index += 1
+					continue
+				}
+				if (markdownBlockquoteMatch(line) !== null) {
+					const parsed = markdownParseBlockquote(lines, index, depth)
+					blocks.push(parsed.block)
+					index = parsed.next
+					continue
+				}
+				if (markdownListMarker(line)) {
+					const parsed = markdownParseList(lines, index, depth)
+					blocks.push(parsed.block)
+					index = parsed.next
+					continue
+				}
+				const table = markdownTryTable(lines, index, depth)
+				if (table) {
+					blocks.push(table.block)
+					index = table.next
+					continue
+				}
+				if (markdownLeadingColumns(line) >= 4) {
+					const parsed = markdownParseIndentedCode(lines, index)
+					blocks.push(parsed.block)
+					index = parsed.next
+					continue
+				}
+				const paragraph = markdownParseParagraph(lines, index)
+				blocks.push(paragraph.block)
+				index = paragraph.next > index ? paragraph.next : index + 1
+			}
+			return blocks
+		}
+
+		// --- Inline parsing -------------------------------------------------
+
+		function markdownCodeSpans(source) {
+			const spans = new Map()
+			let index = 0
+			while (index < source.length) {
+				const ch = source.charAt(index)
+				if (ch === '\\') {
+					index += 2
+					continue
+				}
+				if (ch !== '`') {
+					index += 1
+					continue
+				}
+				let run = 1
+				while (index + run < source.length && source.charAt(index + run) === '`') run += 1
+				const marker = new Array(run + 1).join('`')
+				let search = index + run
+				let close = -1
+				while (search < source.length) {
+					const found = source.indexOf(marker, search)
+					if (found === -1) break
+					const before = found > 0 ? source.charAt(found - 1) : ''
+					const after = source.charAt(found + run)
+					if (before !== '`' && after !== '`') {
+						close = found
+						break
+					}
+					search = found + run
+				}
+				if (close === -1) {
+					index += run
+					continue
+				}
+				spans.set(index, { end: close + run, value: source.slice(index + run, close) })
+				index = close + run
+			}
+			return spans
+		}
+
+		function markdownNormalizeCodeSpan(value) {
+			let text = value.replace(/\n/g, ' ')
+			if (text.length >= 2 && text.charAt(0) === ' ' && text.charAt(text.length - 1) === ' ' && text.trim() !== '') {
+				text = text.slice(1, -1)
+			}
+			return text
+		}
+
+		function markdownDelimiterRun(source, start, length, char) {
+			const end = start + length
+			const before = start === 0 ? '\n' : source.charAt(start - 1)
+			const after = end >= source.length ? '\n' : source.charAt(end)
+			const beforeWhitespace = /\s/.test(before)
+			const afterWhitespace = /\s/.test(after)
+			const beforePunctuation = MARKDOWN_ASCII_PUNCTUATION_RE.test(before)
+			const afterPunctuation = MARKDOWN_ASCII_PUNCTUATION_RE.test(after)
+			const leftFlanking = !afterWhitespace && (!afterPunctuation || beforeWhitespace || beforePunctuation)
+			const rightFlanking = !beforeWhitespace && (!beforePunctuation || afterWhitespace || afterPunctuation)
+			let canOpen = leftFlanking
+			let canClose = rightFlanking
+			if (char === '_') {
+				canOpen = leftFlanking && (!rightFlanking || beforePunctuation)
+				canClose = rightFlanking && (!leftFlanking || afterPunctuation)
+			}
+			if (char === '~') {
+				const enough = length >= 2
+				canOpen = enough && leftFlanking
+				canClose = enough && rightFlanking
+			}
+			return { start, end, char, length, canOpen, canClose }
+		}
+
+		function markdownMatchDelimiters(runs) {
+			const pairs = new Map()
+			const stacks = { '*': [], _: [], '~': [] }
+			for (let index = 0; index < runs.length; index += 1) {
+				const run = runs[index]
+				const stack = stacks[run.char]
+				let openerIndex = -1
+				if (run.canClose) {
+					for (let cursor = stack.length - 1; cursor >= 0; cursor -= 1) {
+						const opener = stack[cursor]
+						if (run.char !== '~' || (opener.length >= 2 && run.length >= 2)) {
+							openerIndex = cursor
+							break
+						}
+					}
+				}
+				if (openerIndex >= 0) {
+					const opener = stack[openerIndex]
+					stack.length = openerIndex
+					pairs.set(opener.start, {
+						close: run.start,
+						char: run.char,
+						strong: run.length >= 2 && opener.length >= 2,
+						triple: run.length >= 3 && opener.length >= 3,
+					})
+					continue
+				}
+				if (run.canOpen) stack.push(run)
+			}
+			return pairs
+		}
+
+		function markdownInlineScaffold(source) {
+			const codeSpans = markdownCodeSpans(source)
+			const brackets = new Map()
+			const parens = new Map()
+			const runs = []
+			const runByStart = new Map()
+			const bracketStack = []
+			const parenStack = []
+			let index = 0
+			while (index < source.length) {
+				const span = codeSpans.get(index)
+				if (span) {
+					index = span.end
+					continue
+				}
+				const ch = source.charAt(index)
+				if (ch === '\\') {
+					index += 2
+					continue
+				}
+				if (ch === '[') {
+					bracketStack.push(index)
+					index += 1
+					continue
+				}
+				if (ch === ']') {
+					if (bracketStack.length > 0) brackets.set(bracketStack.pop(), index)
+					index += 1
+					continue
+				}
+				if (ch === '(') {
+					parenStack.push(index)
+					index += 1
+					continue
+				}
+				if (ch === ')') {
+					if (parenStack.length > 0) parens.set(parenStack.pop(), index)
+					index += 1
+					continue
+				}
+				if (ch === '*' || ch === '_' || ch === '~') {
+					let run = 1
+					while (index + run < source.length && source.charAt(index + run) === ch) run += 1
+					const info = markdownDelimiterRun(source, index, run, ch)
+					runs.push(info)
+					runByStart.set(index, info)
+					index += run
+					continue
+				}
+				index += 1
+			}
+			return { codeSpans, brackets, parens, runs, runByStart, pairs: markdownMatchDelimiters(runs) }
+		}
+
+		function markdownCleanDestination(value) {
+			let destination = String(value === undefined ? '' : value).trim()
+			if (destination.length >= 2 && destination.charAt(0) === '<' && destination.charAt(destination.length - 1) === '>') {
+				destination = destination.slice(1, -1)
+			}
+			const title = /^(\S+)[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\))[ \t]*$/.exec(destination)
+			if (title) destination = title[1]
+			return markdownDecodeEntitiesIn(markdownUnescape(destination)).trim()
+		}
+
+		function markdownPlainInlineText(nodes) {
+			let out = ''
+			if (!Array.isArray(nodes)) return out
+			for (let index = 0; index < nodes.length; index += 1) {
+				const node = nodes[index]
+				if (!node) continue
+				if (node.type === 'text' || node.type === 'code') out += String(node.value === undefined ? '' : node.value)
+				else if (node.type === 'br') out += ' '
+				else if (node.children) out += markdownPlainInlineText(node.children)
+			}
+			return out
+		}
+
+		function markdownParseInline(source, depth) {
+			const level = typeof depth === 'number' ? depth : 0
+			if (typeof source !== 'string' || source === '') return []
+			if (level > MARKDOWN_MAX_INLINE_DEPTH) {
+				return [markdownTextNode(markdownDecodeEntitiesIn(markdownUnescape(source)))]
+			}
+			const scaffold = markdownInlineScaffold(source)
+			const nodes = []
+			let text = ''
+			const flush = () => {
+				if (text !== '') {
+					nodes.push({ type: 'text', value: text })
+					text = ''
+				}
+			}
+			let index = 0
+			while (index < source.length) {
+				const span = scaffold.codeSpans.get(index)
+				if (span) {
+					flush()
+					nodes.push({ type: 'code', value: markdownNormalizeCodeSpan(span.value) })
+					index = span.end
+					continue
+				}
+				const ch = source.charAt(index)
+				if (ch === '\\') {
+					const next = index + 1 < source.length ? source.charAt(index + 1) : ''
+					if (next !== '' && MARKDOWN_ASCII_PUNCTUATION_RE.test(next)) {
+						text += next
+						index += 2
+					} else {
+						text += '\\'
+						index += 1
+					}
+					continue
+				}
+				const pair = scaffold.pairs.get(index)
+				if (pair) {
+					const opener = scaffold.runByStart.get(index)
+					if (opener) {
+						flush()
+						const inner = source.slice(opener.end, pair.close)
+						const children = markdownParseInline(inner, level + 1)
+						const node =
+							pair.char === '~'
+								? { type: 'del', children }
+								: pair.triple
+									? { type: 'strong', children: [{ type: 'em', children }] }
+									: { type: pair.strong ? 'strong' : 'em', children }
+						nodes.push(node)
+						const closer = scaffold.runByStart.get(pair.close)
+						index = closer ? closer.end : pair.close + 1
+						continue
+					}
+				}
+				const run = scaffold.runByStart.get(index)
+				if (run) {
+					flush()
+					nodes.push({ type: 'text', value: source.slice(run.start, run.end) })
+					index = run.end
+					continue
+				}
+				if (ch === '!' && source.charAt(index + 1) === '[') {
+					const open = index + 1
+					const close = scaffold.brackets.get(open)
+					if (close !== undefined && source.charAt(close + 1) === '(') {
+						const closeParen = scaffold.parens.get(close + 1)
+						if (closeParen !== undefined) {
+							flush()
+							const label = markdownParseInline(source.slice(open + 1, close), level + 1)
+							const alt = markdownPlainInlineText(label)
+							const src = markdownCleanDestination(source.slice(close + 2, closeParen))
+							nodes.push({ type: 'image', src, alt })
+							index = closeParen + 1
+							continue
+						}
+					}
+					text += '!'
+					index += 1
+					continue
+				}
+				if (ch === '[') {
+					const close = scaffold.brackets.get(index)
+					if (close !== undefined && source.charAt(close + 1) === '(') {
+						const closeParen = scaffold.parens.get(close + 1)
+						if (closeParen !== undefined) {
+							flush()
+							const label = markdownParseInline(source.slice(index + 1, close), level + 1)
+							const href = markdownCleanDestination(source.slice(close + 2, closeParen))
+							nodes.push({ type: 'link', href, children: label })
+							index = closeParen + 1
+							continue
+						}
+					}
+					text += '['
+					index += 1
+					continue
+				}
+				if (ch === '<') {
+					MARKDOWN_URI_AUTOLINK_RE.lastIndex = index
+					const uri = MARKDOWN_URI_AUTOLINK_RE.exec(source)
+					if (uri) {
+						flush()
+						const target = markdownDecodeEntitiesIn(uri[1])
+						nodes.push({ type: 'link', href: target, children: [markdownTextNode(target)] })
+						index += uri[0].length
+						continue
+					}
+					MARKDOWN_EMAIL_AUTOLINK_RE.lastIndex = index
+					const email = MARKDOWN_EMAIL_AUTOLINK_RE.exec(source)
+					if (email) {
+						flush()
+						nodes.push({
+							type: 'link',
+							href: 'mailto:' + email[1],
+							children: [markdownTextNode(email[1])],
+						})
+						index += email[0].length
+						continue
+					}
+					text += '<'
+					index += 1
+					continue
+				}
+				if (ch === '&') {
+					MARKDOWN_ENTITY_AT_RE.lastIndex = index
+					const entity = MARKDOWN_ENTITY_AT_RE.exec(source)
+					if (entity) {
+						text += markdownEntityValue(entity)
+						index += entity[0].length
+						continue
+					}
+					text += '&'
+					index += 1
+					continue
+				}
+				if (ch === '\n') {
+					flush()
+					nodes.push({ type: 'br' })
+					index += 1
+					continue
+				}
+				text += ch
+				index += 1
+			}
+			flush()
+			return nodes
+		}
+
+		// --- Public parse + render -----------------------------------------
+
+		function parseMarkdown(source) {
+			const text = markdownNormalize(source)
+			if (text.trim() === '') return markdownDeepFreeze([])
+			try {
+				const lines = text.split('\n')
+				return markdownDeepFreeze(markdownParseBlocks(lines, 0))
+			} catch (error) {
+				// Untrusted text must never take the panel down: degrade to empty.
+				return markdownDeepFreeze([])
+			}
+		}
+
+		function markdownIsSafeDestination(value) {
+			if (typeof value !== 'string') return false
+			const destination = value.trim()
+			if (destination === '') return false
+			const scheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(destination)
+			if (!scheme) return false
+			return MARKDOWN_ALLOWED_SCHEMES.indexOf(scheme[1].toLowerCase()) !== -1
+		}
+
+		function markdownCreateElement(h, type, props, children) {
+			const list = children || []
+			if (list.length === 0) return h(type, props)
+			if (list.length <= 512) return h(type, props, ...list)
+			// Very large child lists exceed the engine call-argument limit; React
+			// accepts an array child and flattens it, so keep the render safe.
+			return h(type, props, list)
+		}
+
+		function markdownFlattenInto(target, value) {
+			if (value === null || value === undefined) return
+			if (Array.isArray(value)) {
+				for (let index = 0; index < value.length; index += 1) markdownFlattenInto(target, value[index])
+				return
+			}
+			target.push(value)
+		}
+
+		function markdownRenderInlines(nodes, h) {
+			const out = []
+			if (!Array.isArray(nodes)) return out
+			for (let index = 0; index < nodes.length; index += 1) {
+				const node = nodes[index]
+				if (node === null || node === undefined) continue
+				if (typeof node === 'string') {
+					out.push(node)
+					continue
+				}
+				if (typeof node.type !== 'string') continue
+				switch (node.type) {
+					case 'text':
+						out.push(String(node.value === undefined ? '' : node.value))
+						break
+					case 'br':
+						out.push(h('br', null))
+						break
+					case 'strong':
+						out.push(markdownCreateElement(h, 'strong', null, markdownRenderInlines(node.children, h)))
+						break
+					case 'em':
+						out.push(markdownCreateElement(h, 'em', null, markdownRenderInlines(node.children, h)))
+						break
+					case 'del':
+						out.push(markdownCreateElement(h, 'del', null, markdownRenderInlines(node.children, h)))
+						break
+					case 'code':
+						out.push(markdownCreateElement(h, 'code', null, [String(node.value === undefined ? '' : node.value)]))
+						break
+					case 'link': {
+						const children = markdownRenderInlines(node.children, h)
+						if (markdownIsSafeDestination(node.href)) {
+							out.push(
+								markdownCreateElement(
+									h,
+									'a',
+									{ href: node.href.trim(), target: '_blank', rel: 'noopener noreferrer nofollow' },
+									children,
+								),
+							)
+						} else {
+							markdownFlattenInto(out, children)
+						}
+						break
+					}
+					case 'image': {
+						const alt = typeof node.alt === 'string' ? node.alt : ''
+						// Safe destination: the anchor is labelled with the alt text and
+						// falls back to the source string. Unsafe/relative destination:
+						// only the alt text survives as plain text (never a link, never an
+						// image, never a fetch).
+						const label = alt.trim() !== '' ? alt : String(node.src === undefined ? '' : node.src)
+						if (markdownIsSafeDestination(node.src)) {
+							out.push(
+								markdownCreateElement(
+									h,
+									'a',
+									{ href: node.src.trim(), target: '_blank', rel: 'noopener noreferrer nofollow' },
+									[label],
+								),
+							)
+						} else if (alt !== '') {
+							out.push(alt)
+						}
+						break
+					}
+					default:
+						break
+				}
+			}
+			return out
+		}
+
+		function markdownRenderTable(node, h) {
+			const align = Array.isArray(node.align) ? node.align : []
+			const headerCells = []
+			for (let column = 0; column < node.header.length; column += 1) {
+				const cell = node.header[column]
+				const props = align[column] ? { 'data-align': align[column] } : null
+				headerCells.push(markdownCreateElement(h, 'th', props, markdownRenderInlines(cell.children, h)))
+			}
+			const headRow = markdownCreateElement(h, 'tr', null, headerCells)
+			const thead = markdownCreateElement(h, 'thead', null, [headRow])
+			const bodyRows = []
+			for (let row = 0; row < node.children.length; row += 1) {
+				const cells = node.children[row]
+				const rowCells = []
+				for (let column = 0; column < cells.length; column += 1) {
+					const cell = cells[column]
+					const props = align[column] ? { 'data-align': align[column] } : null
+					rowCells.push(markdownCreateElement(h, 'td', props, markdownRenderInlines(cell.children, h)))
+				}
+				bodyRows.push(markdownCreateElement(h, 'tr', null, rowCells))
+			}
+			const tbody = markdownCreateElement(h, 'tbody', null, bodyRows)
+			return markdownCreateElement(h, 'table', null, [thead, tbody])
+		}
+
+		function markdownRenderList(node, h) {
+			const tag = node.ordered ? 'ol' : 'ul'
+			const props = node.ordered && node.start !== 1 ? { start: node.start } : null
+			const items = []
+			for (let index = 0; index < node.children.length; index += 1) {
+				const item = node.children[index]
+				const children = []
+				if (item.task) {
+					children.push(
+						h('input', {
+							type: 'checkbox',
+							disabled: true,
+							defaultChecked: item.checked === true,
+							'aria-label': typeof item.text === 'string' ? item.text : '',
+						}),
+					)
+				}
+				markdownFlattenInto(children, markdownRenderBlocks(item.children, h, node.tight))
+				items.push(markdownCreateElement(h, 'li', null, children))
+			}
+			return markdownCreateElement(h, tag, props, items)
+		}
+
+		function markdownRenderBlock(node, h) {
+			if (!node || typeof node.type !== 'string') return null
+			switch (node.type) {
+				case 'paragraph':
+					return markdownCreateElement(h, 'p', null, markdownRenderInlines(node.children, h))
+				case 'heading': {
+					const tag = MARKDOWN_HEADING_TAGS[node.level] || 'h6'
+					return markdownCreateElement(h, tag, null, markdownRenderInlines(node.children, h))
+				}
+				case 'code': {
+					const props = node.lang ? { 'data-lang': node.lang } : null
+					const code = markdownCreateElement(h, 'code', props, [String(node.value === undefined ? '' : node.value)])
+					return markdownCreateElement(h, 'pre', null, [code])
+				}
+				case 'hr':
+					return h('hr', null)
+				case 'blockquote':
+					return markdownCreateElement(h, 'blockquote', null, markdownRenderBlocks(node.children, h, false))
+				case 'list':
+					return markdownRenderList(node, h)
+				case 'table':
+					return markdownRenderTable(node, h)
+				default:
+					return null
+			}
+		}
+
+		function markdownRenderBlocks(blocks, h, tight) {
+			const out = []
+			if (!Array.isArray(blocks)) return out
+			for (let index = 0; index < blocks.length; index += 1) {
+				const node = blocks[index]
+				if (node === null || node === undefined) continue
+				if (tight && node.type === 'paragraph') {
+					markdownFlattenInto(out, markdownRenderInlines(node.children, h))
+					continue
+				}
+				markdownFlattenInto(out, markdownRenderBlock(node, h))
+			}
+			return out
+		}
+
+		function renderMarkdown(ast, h) {
+			if (!Array.isArray(ast) || typeof h !== 'function') return []
+			return markdownRenderBlocks(ast, h, false)
+		}
+
+		// ------------------------------------------------------------------
+		// Shared Markdown surface component (KB-57)
+		//
+		// The engine above owns parsing and element construction; this component
+		// only decorates the rendered element tree with the accessibility
+		// affordances the surfaces need (labelled scroll regions, external-link
+		// names, table header scope). Parsing is memoized on the raw text while
+		// rendering re-runs on a locale change, so translated aria labels update
+		// without a second parse. Empty text renders nothing at all: each surface
+		// keeps its own localized empty state instead of an empty bordered box.
+		// ------------------------------------------------------------------
+
+		function markdownPlainText(value) {
+			if (typeof value === 'string') return value
+			if (typeof value === 'number') return String(value)
+			if (Array.isArray(value)) {
+				let out = ''
+				for (let index = 0; index < value.length; index += 1) out += markdownPlainText(value[index])
+				return out
+			}
+			if (value && typeof value === 'object') {
+				// The fake-React harness stores rest children on the element; the
+				// real React element exposes them as props.children.
+				const children = value.children !== undefined ? value.children : value.props && value.props.children
+				return children === undefined ? '' : markdownPlainText(children)
+			}
+			return ''
+		}
+
+		function markdownLinkHost(href) {
+			if (typeof href !== 'string') return ''
+			const destination = href.trim()
+			if (destination === '') return ''
+			try {
+				const parsed = new URL(destination)
+				if (parsed.protocol === 'mailto:') return destination.slice('mailto:'.length).split('?')[0]
+				return parsed.host || ''
+			} catch (error) {
+				return ''
+			}
+		}
+
+		function markdownDecorator(t, h) {
+			const translate = typeof t === 'function' ? t : (key) => key
+			return function decorateMarkdownElement(type, props, ...children) {
+				const next = props && typeof props === 'object' ? Object.assign({}, props) : {}
+				if (type === 'th') next.scope = 'col'
+				if (type === 'pre') {
+					next.tabIndex = 0
+					next['aria-label'] = translate('md.codeBlock')
+				}
+				if (type === 'a') {
+					const host = markdownLinkHost(next.href)
+					const visible = markdownPlainText(children).trim()
+					const parts = []
+					if (visible !== '' && visible !== host) parts.push(visible)
+					if (host !== '') parts.push(host)
+					parts.push(translate('md.linkExternal'))
+					next['aria-label'] = parts.join(' — ')
+					const linkChildren = children.concat([h(IconExternal, { className: 'kb-md-linkIcon', size: 11 })])
+					if (linkChildren.length > 512) return h('a', next, linkChildren)
+					return h('a', next, ...linkChildren)
+				}
+				if (type === 'table') {
+					return h(
+						'div',
+						{ className: 'kb-md-tableWrap', role: 'region', tabIndex: 0, 'aria-label': translate('md.table') },
+						h('table', next, ...children),
+					)
+				}
+				if (children.length === 0) return h(type, Object.keys(next).length > 0 ? next : null)
+				return h(type, Object.keys(next).length > 0 ? next : null, ...children)
+			}
+		}
+
+		function MarkdownBodyContent(props) {
+			const text = typeof props.text === 'string' ? props.text : ''
+			// Only parsing is memoized; every render re-decorates so a locale
+			// change updates the aria labels without parsing the text again.
+			const ast = React.useMemo(() => parseMarkdown(text), [text])
+			const decorate = markdownDecorator(props.t, h)
+			const children = renderMarkdown(ast, decorate)
+			if (!Array.isArray(children) || children.length === 0) return null
+			const wrapperProps = { className: classNames('kb-md', typeof props.className === 'string' ? props.className : '') }
+			if (typeof props.label === 'string' && props.label !== '') wrapperProps['aria-label'] = props.label
+			// Mirror the engine's argument-limit guard for hostile, very large documents.
+			if (children.length > 512) return h('div', wrapperProps, children)
+			return h('div', wrapperProps, ...children)
+		}
+
+		function MarkdownBody(props) {
+			const text = props && typeof props.text === 'string' ? props.text : ''
+			// Empty/whitespace input renders nothing (no wrapper, no border) and
+			// never reaches the parse hook, so surfaces keep their own empty copy.
+			if (text.trim() === '') return null
+			return h(MarkdownBodyContent, props)
+		}
+
+		// KB-59: plain accessible-name projection for the surfaces that keep a native
+		// input beside rendered Markdown (the blocked-execution answer fields). It
+		// mirrors what a reader sees — link labels without their destinations, code
+		// text without delimiters, one line — by stripping markers instead of
+		// parsing, so an aria label never adds a second parse to a polling render.
+		// KB-60 reuses it for the collapsed thought-row preview: block and inline
+		// syntax is stripped while literal characters (`C#`, `issue #12`, a pipe in
+		// prose) and fenced-code content survive.
+		// This stays a local helper: the engine's public export is unchanged.
+		function markdownPlainLabel(source) {
+			if (typeof source !== 'string' || source === '') return ''
+			const lines = source.replace(/\r\n?/g, '\n').split('\n')
+			// Fences and GFM tables are structural: their delimiter lines disappear and
+			// their content is projected as text, never mistaken for block markers or
+			// for prose. Mark them in a first pass so the line pass below stays pure.
+			const codeLine = new Array(lines.length).fill(false)
+			const tableLine = new Array(lines.length).fill(false)
+			const fenceLine = new Array(lines.length).fill(false)
+			let fence = null
+			for (let index = 0; index < lines.length; index += 1) {
+				const line = lines[index]
+				if (fence) {
+					const close = new RegExp('^[ \\t]*' + (fence.char === '`' ? '`' : '~') + '{' + fence.length + ',}[ \\t]*$')
+					if (close.test(line)) {
+						fenceLine[index] = true
+						fence = null
+					} else {
+						codeLine[index] = true
+					}
+					continue
+				}
+				const open = /^[ \t]*(`{3,}|~{3,})/.exec(line)
+				if (open) {
+					fenceLine[index] = true
+					fence = { char: open[1].charAt(0), length: open[1].length }
+				}
+			}
+			const isTableRule = (line) =>
+				line.indexOf('|') !== -1 && /^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/.test(line)
+			const isListLine = (line) => /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/.test(line)
+			// Indented code (four or more spaces) is content, so its markers must
+			// survive. A four-space line after a list item is a nested list item, not
+			// code, which is why the previous non-blank line decides.
+			const indentedCode = new Array(lines.length).fill(false)
+			for (let index = 0; index < lines.length; index += 1) {
+				if (codeLine[index] || fenceLine[index] || !/^[ \t]{4,}\S/.test(lines[index])) continue
+				let previous = index - 1
+				while (previous >= 0 && lines[previous].trim() === '') previous -= 1
+				const separated = index > 0 && lines[index - 1].trim() === ''
+				if (previous < 0 || indentedCode[previous] || (separated && !isListLine(lines[previous]))) indentedCode[index] = true
+			}
+			for (let index = 0; index + 1 < lines.length; index += 1) {
+				if (codeLine[index] || codeLine[index + 1] || tableLine[index]) continue
+				if (lines[index].indexOf('|') === -1 || !isTableRule(lines[index + 1])) continue
+				tableLine[index] = true
+				tableLine[index + 1] = true
+				for (let row = index + 2; row < lines.length; row += 1) {
+					if (codeLine[row] || tableLine[row] || lines[row].trim() === '' || lines[row].indexOf('|') === -1) break
+					tableLine[row] = true
+				}
+			}
+			// Images keep their alt text; links keep their label, never the destination.
+			// One level of balanced parentheses is allowed inside a destination so a
+			// hostile `[click](javascript:alert(1))` projects to just `click`.
+			const projectInline = (line) => {
+				// Backslash-escaped punctuation is literal content, not syntax. Park each
+				// escaped character behind a token so the strippers below cannot consume it,
+				// then restore the character itself at the end.
+				const escaped = []
+				let text = line.replace(/\\([\\`*_{}\[\]()#+\-.!|>~])/g, (match, char) => {
+					escaped.push(char)
+					return '\u0001' + (escaped.length - 1) + '\u0002'
+				})
+				text = text.replace(/!\[([^\]]*)\]\(([^()\n]|\([^()\n]*\))*\)/g, '$1')
+				text = text.replace(/\[([^\]]*)\]\(([^()\n]|\([^()\n]*\))*\)/g, '$1')
+				// Code spans and emphasis / strike delimiters.
+				text = text.replace(/`+/g, '')
+				text = text.replace(/~~(?=\S)([^~]+?)~~/g, '$1')
+				text = text.replace(/\*\*\*(?=\S)([^*]+?)\*\*\*/g, '$1')
+				text = text.replace(/\*\*(?=\S)([^*]+?)\*\*/g, '$1')
+				text = text.replace(/\*(?=\S)([^*]+?)\*/g, '$1')
+				text = text.replace(/(^|[\s([{])_+(?=\S)([^_\n]+?)_+(?=[\s)\]}.,;:!?]|$)/g, '$1$2')
+				// An angle autolink's target is its visible label, so keep the target and
+				// drop only the brackets (`<https://…>` / `<user@example.com>`).
+				text = text.replace(/<((?:[a-z][a-z0-9+.-]*:[^<>\s]+)|(?:[^<>@\s]+@[^<>@\s]+\.[^<>@\s]+))>/gi, '$1')
+				text = text.replace(/\u0001(\d+)\u0002/g, (match, index) => escaped[Number(index)] || '')
+				return text
+			}
+			const projected = []
+			for (let index = 0; index < lines.length; index += 1) {
+				const line = lines[index]
+				if (fenceLine[index]) continue
+				// Code-block content survives verbatim (whitespace collapses at the end).
+				if (codeLine[index]) {
+					projected.push(line)
+					continue
+				}
+				if (indentedCode[index]) {
+					projected.push(line)
+					continue
+				}
+				if (tableLine[index]) {
+					if (isTableRule(line)) continue
+					// Row pipes are structural; an escaped pipe stays a literal cell pipe.
+					// Cell content runs through the same inline projection as prose, so a
+					// cell carrying **bold**, `code` or [a link](url) also stays clean.
+					const cells = line
+						.replace(/^[ \t]*\|/, '')
+						.replace(/\|[ \t]*$/, '')
+						.replace(/\\\|/g, '\u0000')
+						.split('|')
+						.map((cell) => projectInline(cell.replace(/\u0000/g, '|').trim()))
+					projected.push(cells.join(' '))
+					continue
+				}
+				// Thematic breaks and setext underlines.
+				if (/^[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(line)) continue
+				if (/^[ \t]{0,3}=+[ \t]*$/.test(line)) continue
+				let block = line
+				// Nested blockquote markers, then headings, then task/list markers.
+				while (/^[ \t]{0,3}>[ \t]?/.test(block)) block = block.replace(/^[ \t]{0,3}>[ \t]?/, '')
+				const heading = /^[ \t]{0,3}#{1,6}(?:[ \t]+|$)/.test(block)
+				block = block.replace(/^[ \t]{0,3}#{1,6}(?:[ \t]+|$)/, '')
+				// An ATX closing sequence is syntax only on a heading line; a paragraph
+				// ending in `#` characters keeps them (`C#`, `issue #12`).
+				if (heading) block = block.replace(/[ \t]+#+[ \t]*$/, '')
+				block = block.replace(/^[ \t]*(?:[-*+][ \t]+\[[ xX]\][ \t]+|[-*+][ \t]+|\d{1,9}[.)][ \t]+)/, '')
+				projected.push(projectInline(block))
+			}
+			return projected.join(' ').replace(/\s+/g, ' ').trim()
+		}
+
+		// ------------------------------------------------------------------
 		// Plugin registration
 		// ------------------------------------------------------------------
 
@@ -6451,13 +11368,24 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 				}
 			}
 
+			// Voice dictation (KB-2): the installed voice bundle mounts an
+			// optional experimental `remote.speech` namespace. Look it up lazily
+			// so the board loads and the dialog stays text-only when it is absent.
+			const getSpeech = () => {
+				try {
+					return typeof ctx.get === 'function' ? ctx.get('remote.speech') || null : null
+				} catch (error) {
+					return null
+				}
+			}
+
 			ctx.slots.inject('main', () =>
 				ctx.slots.register(
 					{
 						name: 'main',
 						key: 'kanban',
 						locale: NS,
-						inject: () => ({ openSession, readSessionCwd }),
+						inject: () => ({ openSession, readSessionCwd, getSpeech }),
 					},
 					KanbanPageBoundary,
 				),
@@ -6477,7 +11405,87 @@ body[data-ds-dark-theme] .kb-btn--danger{color:color-mix(in srgb,var(--dsw-alias
 			)
 		}
 
-		return { inject, apply }
+		const plugin = { inject, apply }
+
+		// KB-56: additive, unconditional export of the safe Markdown engine
+		// (`parse` -> deep-frozen AST, `render` -> React elements only).
+		// KB-57 extends it with the shared `MarkdownBody` surface component.
+		plugin.markdown = Object.freeze({ parse: parseMarkdown, render: renderMarkdown, MarkdownBody })
+		// Test seam (KB-60): the dependency-free Markdown suite drives the collapsed
+		// thought-row projection, and the probe renders one row at component level for
+		// the failed-only branch a paused board cannot produce safely. Production
+		// exports stay apply/inject.
+		if (typeof globalThis === 'object' && globalThis.__KB60_THOUGHT_TEST__ === true) {
+			plugin.__thoughtRow = Object.freeze({ project: markdownPlainLabel, ThoughtRowView })
+		}
+		// Test seam: the dependency-free client harness sets this before it
+		// materializes the module so tests/voice.test.mjs can drive the dictation
+		// engine with a fake bundle double. Production exports stay apply/inject.
+		if (typeof globalThis === 'object' && globalThis.__KB2_VOICE_TEST__ === true) {
+			plugin.__voice = { appendTranscript, encodeWave, waveBase64, captureFailureKind, readVoiceCatalog, createVoiceEngine }
+		}
+		// Test seam (KB-76): the dependency-free UI suite drives the pure autopilot
+		// state machine, the preview projection and the debounced commit queue
+		// without a DOM. Production exports stay apply/inject.
+		if (typeof globalThis === 'object' && globalThis.__KB4_AUTOPILOT_UI_TEST__ === true) {
+			plugin.__autopilot = {
+				AUTOPILOT_ALERT_REASONS,
+				AUTOPILOT_COMMIT_MS,
+				AUTOPILOT_CONFIRM_KEY,
+				AUTOPILOT_CADENCE_MINUTES,
+				AUTOPILOT_DEPTH_OPTIONS,
+				AUTOPILOT_FEED_MAX,
+				AUTOPILOT_LANE_CAP_OPTIONS,
+				AUTOPILOT_LANES,
+				AUTOPILOT_PULSE_KEEP,
+				AUTOPILOT_REASON_CODES,
+				AUTOPILOT_TRIGGERS,
+				applyAutopilotPatch,
+				autopilotBudgetRows,
+				autopilotCountdownAria,
+				autopilotCountdownLabel,
+				autopilotCountdownMode,
+				autopilotCountdownRemaining,
+				autopilotCountdownSeconds,
+				autopilotErrorText,
+				autopilotExecutionLane,
+				autopilotFeedState,
+				autopilotLaneAdmission,
+				autopilotLaneAdmissions,
+				autopilotLaneOccupancy,
+				autopilotPauseCause,
+				autopilotPulseAlertReasons,
+				autopilotReasonLabel,
+				autopilotReasonSummary,
+				autopilotStateLabel,
+				autopilotTriggerLabel,
+				autopilotViewFromSnapshot,
+				autopilotConfigFromStatus,
+				buildAutopilotAlerts,
+				buildAutopilotFeed,
+				buildAutopilotPreview,
+				canPreviewAutopilot,
+				canPulseAutopilot,
+				createAutopilotCommitQueue,
+				formatAutopilotDuration,
+				formatAutopilotPulseStamp,
+				formatAutopilotPulseTime,
+				initialAutopilotCountdown,
+				initialAutopilotPulseState,
+				initialAutopilotUi,
+				markAutopilotConfirmSeen,
+				memberAutopilotState,
+				mergeAutopilotPatch,
+				mergeAutopilotPulses,
+				normalizeAutopilotConfig,
+				normalizeAutopilotError,
+				readAutopilotConfirmSeen,
+				reduceAutopilot,
+				reduceAutopilotCountdown,
+				reduceAutopilotPulseState,
+			}
+		}
+		return plugin
 
 	},
 })

@@ -212,7 +212,7 @@ const h = await createHarness();
 
 // --- seeding + snapshot contract -------------------------------------------
 let snap = await h.state();
-check('snapshot version 2', snap.version === 2, String(snap.version));
+check('snapshot version 3', snap.version === 3, String(snap.version));
 check('rng seededAt persisted', Number.isFinite(snap.board?.team?.seededAt), String(snap.board?.team?.seededAt));
 check('roster seeded with 10', snap.roster?.length === 10, String(snap.roster?.length));
 check(
@@ -384,13 +384,13 @@ const dispatched = (await h5.state()).board.tickets.find((ticket) => ticket.id =
 const execSession = dispatched.execution.sessionId;
 await h5.tool.execute({ action: 'claim', ticketId: bugTicketId }, h5.asAgent(execSession));
 snap = await h5.state();
-check('working status while owning in-progress ticket', snap.roster.find((row) => row.id === 'member-bug-fixer')?.status === 'working', snap.roster.find((row) => row.id === 'member-bug-fixer')?.status);
+check('running status while the attached agent is executing', snap.roster.find((row) => row.id === 'member-bug-fixer')?.status === 'running', snap.roster.find((row) => row.id === 'member-bug-fixer')?.status);
 check('current ticket recorded', snap.roster.find((row) => row.id === 'member-bug-fixer')?.currentTicket?.id === bugTicketId);
 check('since recorded', Number.isFinite(snap.roster.find((row) => row.id === 'member-bug-fixer')?.since));
 // Paused overrides working.
 res = await h5.action('updateMember', { memberId: 'member-bug-fixer', patch: { paused: true } });
 snap = await h5.state();
-check('paused overrides working', snap.roster.find((row) => row.id === 'member-bug-fixer')?.status === 'paused');
+check('paused overrides running', snap.roster.find((row) => row.id === 'member-bug-fixer')?.status === 'paused');
 check('pause cancels linked session', h5.cancelled.includes(execSession), JSON.stringify(h5.cancelled));
 await h5.action('updateMember', { memberId: 'member-bug-fixer', patch: { paused: false } });
 // Busy member cannot be deleted without force.
@@ -399,6 +399,95 @@ expectStatus('busy member delete rejected', res, 409, 'member/busy');
 res = await h5.action('deleteMember', { memberId: 'member-bug-fixer', force: true });
 check('force delete removes member', res.status === 200 && (await h5.state()).roster.every((row) => row.id !== 'member-bug-fixer'));
 check('force delete cleared owner memberId', (await h5.state()).board.tickets.every((ticket) => ticket.owner?.memberId !== 'member-bug-fixer'));
+
+// --- fixed roster + truthful attached-agent status --------------------------
+// Regression for the live-board report: a member that owns a Review ticket whose
+// execution is done must NOT read as busy, an assignment-only member must stay
+// offline, and legacy session rows must never leak back into the team list.
+const FIXED_AT = 1_800_000_000_000;
+async function createSeededTeamHarness(label, patch = {}) {
+  const h = await createHarness({ label });
+  const board = {
+    version: 3,
+    workspaceId: 'workspace-1',
+    projectTitle: 'Demo',
+    projectPath: h.root,
+    createdAt: FIXED_AT,
+    updatedAt: FIXED_AT,
+    paused: false,
+    pausedAt: null,
+    pausedBy: null,
+    wip: { backlog: 0, ready: 0, in_progress: 3, review: 5, done: 0 },
+    nextNumber: 4,
+    tickets: [
+      {
+        id: 'KB-1',
+        number: 1,
+        title: 'Review me',
+        description: '',
+        type: 'task',
+        priority: 'high',
+        column: 'review',
+        role: 'fe-developer',
+        labels: [],
+        owner: { sessionId: 'session-done', name: 'fe · KB-1', role: 'fe-developer', memberId: 'member-fe' },
+        execution: { sessionId: 'session-done', status: 'done', role: 'fe-developer', startColumn: 'in_progress', startedAt: FIXED_AT - 2000, updatedAt: FIXED_AT - 500, finishedAt: FIXED_AT - 500, report: 'done', error: '' },
+        assignment: { role: 'reviewer', accessMode: 'workspace-write', agentSessionId: null, agentName: null, memberId: 'member-reviewer', auto: true, reason: 'Moved in_progress → review', at: FIXED_AT - 500 },
+        createdAt: FIXED_AT - 2000,
+        updatedAt: FIXED_AT - 500,
+        movedAt: FIXED_AT - 500,
+      },
+    ],
+    activity: [],
+    agents: {
+      'session-done': { name: 'fe · KB-1', role: 'fe-developer', memberId: 'member-fe', executionTicketId: 'KB-1', firstSeenAt: FIXED_AT - 2000 },
+      'session-live-2': { name: 'Sherif Shawarma', role: 'fe-developer', memberId: 'member-fe', firstSeenAt: FIXED_AT - 1500 },
+      'session-noise': { name: 'dev · KB-9', role: 'fullstack-developer', firstSeenAt: FIXED_AT - 3000 },
+    },
+    team: {
+      version: 1,
+      seededAt: FIXED_AT,
+      members: [
+        { id: 'member-fe', name: 'Sherif Shawarma', title: 'Senior Frontend Engineer', roleId: 'fe-developer', persona: 'You are Sherif, a frontend engineer.', paused: false, sessionId: 'session-done', lastActivatedAt: 0, createdAt: FIXED_AT, updatedAt: FIXED_AT, createdBy: 'system', source: 'seed' },
+        { id: 'member-reviewer', name: 'Ashraf Ahwa', title: 'Principal Reviewer', roleId: 'reviewer', persona: 'You are Ashraf, a reviewer.', paused: false, sessionId: null, lastActivatedAt: 0, createdAt: FIXED_AT, updatedAt: FIXED_AT, createdBy: 'system', source: 'seed' },
+        { id: 'member-tester', name: 'Tamer Tameya', title: 'QA Lead', roleId: 'tester', persona: 'You are Tamer, a QA lead.', paused: false, sessionId: 'session-gone', lastActivatedAt: 0, createdAt: FIXED_AT, updatedAt: FIXED_AT, createdBy: 'system', source: 'seed' },
+      ],
+      drafts: [],
+    },
+    meta: { vision: null, docs: [], conversations: [], mrs: [], lastScanAt: null },
+    ...patch,
+  };
+  await writeFile(join(h.stateDir, 'workspace-1.json'), JSON.stringify(board));
+  return h;
+}
+const h6 = await createSeededTeamHarness('kanban-team-truth');
+h6.sessions.push(
+  { sessionId: 'session-done', cwd: h6.root, running: false, updatedAt: FIXED_AT, projections: { values: { title: 'fe · KB-1' } } },
+  { sessionId: 'session-live-2', cwd: h6.root, running: false, updatedAt: FIXED_AT - 500, projections: { values: { title: 'You are `Sherif Shawarma`' } } },
+);
+h6.live.set('session-live-2', { id: 'session-live-2', status: 'idle', session: { id: 'session-live-2' }, inbox: { hasPending: false } });
+snap = await h6.state();
+check('fixed team list is the persisted roster', snap.roster.length === 3 && snap.roster.every((row) => ['member-fe', 'member-reviewer', 'member-tester'].includes(row.id)), JSON.stringify(snap.roster.map((row) => row.id)));
+check('no member ever reports the retired working status', snap.roster.every((row) => row.status !== 'working'), JSON.stringify(snap.roster.map((row) => `${row.id}:${row.status}`)));
+check('review-ticket owner with a finished execution is idle, not busy', snap.roster.find((row) => row.id === 'member-fe')?.status === 'idle', snap.roster.find((row) => row.id === 'member-fe')?.statusReason);
+check('an implementer ticket handed off to Review is not a current ticket', snap.roster.find((row) => row.id === 'member-fe')?.currentTicket === null, JSON.stringify(snap.roster.find((row) => row.id === 'member-fe')?.currentTicket));
+check('idle member reports no working-since clock', snap.roster.find((row) => row.id === 'member-fe')?.since === null, String(snap.roster.find((row) => row.id === 'member-fe')?.since));
+check('assignment-only member is offline, not working', snap.roster.find((row) => row.id === 'member-reviewer')?.status === 'offline', snap.roster.find((row) => row.id === 'member-reviewer')?.statusReason);
+check('a reviewer queue keeps the Review ticket as current focus', snap.roster.find((row) => row.id === 'member-reviewer')?.currentTicket?.id === 'KB-1');
+check('stale member.sessionId is offline', snap.roster.find((row) => row.id === 'member-tester')?.status === 'offline', snap.roster.find((row) => row.id === 'member-tester')?.statusReason);
+check('every roster status carries a human reason', snap.roster.every((row) => typeof row.statusReason === 'string' && row.statusReason.length > 0));
+check('team rows expose only attached agents', snap.team.length === 2 && snap.team.every((row) => row.memberId === 'member-fe'), JSON.stringify(snap.team));
+check('legacy unattached session row is pruned from the snapshot board', !('session-noise' in (snap.board.agents ?? {})), JSON.stringify(Object.keys(snap.board.agents ?? {})));
+const persistedAfterPrune = JSON.parse(await readFile(join(h6.stateDir, 'workspace-1.json'), 'utf8'));
+check('legacy unattached session row is pruned on disk', !('session-noise' in (persistedAfterPrune.agents ?? {})), JSON.stringify(Object.keys(persistedAfterPrune.agents ?? {})));
+h6.live.get('session-live-2').status = 'running';
+snap = await h6.state();
+check('multiple attached sessions: the running one wins', snap.roster.find((row) => row.id === 'member-fe')?.status === 'running', snap.roster.find((row) => row.id === 'member-fe')?.statusReason);
+h6.live.get('session-live-2').status = 'idle';
+snap = await h6.state();
+check('when every attached agent is at rest the member is idle again', snap.roster.find((row) => row.id === 'member-fe')?.status === 'idle', snap.roster.find((row) => row.id === 'member-fe')?.statusReason);
+const teamTool = JSON.parse(JSON.stringify(await h6.tool.execute({ action: 'team' }, h6.asAgent('session-observer'))));
+check('kanban team returns the fixed roster, not session rows', Array.isArray(teamTool.team) && teamTool.team.length === 3 && teamTool.team.every((row) => typeof row.id === 'string' && row.id.startsWith('member-')), JSON.stringify(teamTool.team?.map((row) => row.id)));
 
 // --- v1 migration + no reseed ----------------------------------------------
 const v1root = await mkdtemp(join(tmpdir(), 'kanban-team-v1-'));
@@ -500,20 +589,20 @@ function buildMigrationHarness() {
 }
 const migration = buildMigrationHarness();
 let migrated = await migration.state();
-check('v1 board migrates to v2', migrated.version === 2 && migrated.board?.version === 2, String(migrated.board?.version));
+check('v1 board migrates to v3', migrated.version === 3 && migrated.board?.version === 3, String(migrated.board?.version));
 check('v1 tickets preserved', migrated.board.tickets.length === 1 && migrated.board.tickets[0].id === 'KB-3');
 check('v1 checklist preserved', migrated.board.tickets[0].checklist?.[0]?.text === 'Kept checklist');
 check('v1 comments preserved', migrated.board.tickets[0].comments?.[0]?.text === 'Kept comment');
 check('v1 ticket activity preserved', migrated.board.tickets[0].activity?.[0]?.text === 'Kept activity');
 check('v1 board activity preserved', migrated.board.activity?.[0]?.text === 'Legacy board activity');
-check('v1 agents preserved', migrated.board.agents['session-old']?.name === 'Old Agent');
+check('v1 active-ticket agent row preserved', migrated.board.agents['session-old']?.name === 'Old Agent');
 check('v1 meta preserved', migrated.board.meta?.vision === 'Legacy vision');
 check('v1 wip preserved', migrated.board.wip.in_progress === 2 && migrated.board.wip.review === 4, JSON.stringify(migrated.board.wip));
 check('v1 pause preserved', migrated.board.paused === true && migrated.board.pausedBy === 'You');
 check('v1 nextNumber preserved', migrated.board.nextNumber === 7, String(migrated.board.nextNumber));
 check('migrated board seeded roster', migrated.roster?.length === 10, String(migrated.roster?.length));
 const onDisk = JSON.parse(await readFile(join(v1state, 'workspace-v1.json'), 'utf8'));
-check('migration persisted to disk', onDisk.version === 2 && onDisk.team?.members?.length === 10 && onDisk.tickets?.[0]?.id === 'KB-3', String(onDisk.version));
+check('migration persisted to disk', onDisk.version === 3 && onDisk.team?.members?.length === 10 && onDisk.tickets?.[0]?.id === 'KB-3', String(onDisk.version));
 // Delete everyone, then reload: seed must not come back.
 for (const member of migrated.roster) {
   await migration.action('deleteMember', { memberId: member.id, force: true });
@@ -548,6 +637,7 @@ await h2.cleanup();
 await h3.cleanup();
 await h4.cleanup();
 await h5.cleanup();
+await h6.cleanup();
 await rm(v1root, { recursive: true, force: true });
 await rm(v1state, { recursive: true, force: true });
 
