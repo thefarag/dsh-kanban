@@ -20,8 +20,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "assets/screenshots/*.png",
     "tests/*.mjs",
-    "docs/screenshots/*.png",
     "tools/*.mjs"
   ],
   "dsh": {

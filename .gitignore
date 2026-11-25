@@ -11,6 +11,9 @@ node_modules/
 .tmp-*/
 .ui/
 
+# local-only product and design docs (kept out of the public repository for now)
+docs/
+
 # env / secrets
 .env
 .env.*
